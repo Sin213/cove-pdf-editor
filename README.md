@@ -4,10 +4,8 @@ An offline PDF editor for **Linux** and **Windows**. The everyday edits
 most people pay Foxit or Acrobat for — in a focused desktop app that
 never touches the cloud.
 
-![icon](cove_icon.png)
-
 ## Download (v1.0.0)
-
+https://github.com/Sin213/cove-pdf-editor
 | Platform | File |
 | -------- | ---- |
 | Windows (installer) | `cove-pdf-editor-1.0.0-Setup.exe` |
