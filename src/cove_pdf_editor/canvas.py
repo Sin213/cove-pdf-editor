@@ -27,15 +27,16 @@ from PySide6.QtGui import (
     QPixmap,
 )
 from PySide6.QtWidgets import (
+    QGraphicsItem,
     QGraphicsItemGroup,
     QGraphicsPixmapItem,
     QGraphicsScene,
+    QGraphicsTextItem,
     QGraphicsView,
-    QLineEdit,
     QWidget,
 )
 
-from .document import Document
+from .document import Document, EditText
 from .render import PageChar, extract_chars, page_info, render_page, span_bbox, span_text
 
 
@@ -73,34 +74,38 @@ class Tool(Protocol):
     def release(self, canvas: "PageCanvas", qt: QPointF) -> None: ...
 
 
-class InlineEditor(QLineEdit):
-    """QLineEdit positioned over a text span on the canvas. Enter commits,
-    Escape cancels. Loses focus → commit (so clicking elsewhere saves)."""
+class EditableTextItem(QGraphicsTextItem):
+    """A QGraphicsTextItem that behaves like a real inline text editor.
+
+    Enter (without Shift) commits. Escape cancels. Clicking elsewhere
+    (focus-out) also commits — same behaviour Foxit / Word / Acrobat all
+    use. The caller connects to ``committed`` or ``cancelled`` to apply
+    the result.
+    """
 
     committed = Signal(str)
     cancelled = Signal()
 
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setStyleSheet(
-            "QLineEdit { background: #fffacc; color: #000; "
-            "border: 1px solid #ffa000; padding: 0 2px; "
-            "selection-background-color: #4a90e2; selection-color: white; }"
-        )
+    def __init__(self) -> None:
+        super().__init__()
+        self.setTextInteractionFlags(Qt.TextEditorInteraction)
+        self.setFlag(QGraphicsItem.ItemIsFocusable, True)
+        self.setFlag(QGraphicsItem.ItemIsSelectable, False)
         self._done = False
 
     def keyPressEvent(self, event) -> None:  # noqa: ANN001
-        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
-            self._finalize(commit=True)
-            return
         if event.key() == Qt.Key_Escape:
             self._finalize(commit=False)
+            return
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter) and not (
+            event.modifiers() & Qt.ShiftModifier
+        ):
+            self._finalize(commit=True)
             return
         super().keyPressEvent(event)
 
     def focusOutEvent(self, event) -> None:  # noqa: ANN001
         super().focusOutEvent(event)
-        # Commit on blur so the user can click elsewhere to save.
         self._finalize(commit=True)
 
     def _finalize(self, *, commit: bool) -> None:
@@ -108,7 +113,7 @@ class InlineEditor(QLineEdit):
             return
         self._done = True
         if commit:
-            self.committed.emit(self.text())
+            self.committed.emit(self.toPlainText())
         else:
             self.cancelled.emit()
 
@@ -135,6 +140,10 @@ class PageCanvas(QGraphicsView):
         self._chars: list[PageChar] = []
         self._coord = CoordMap(1.0, 1.0)
         self._tool: Tool | None = None
+        # Active inline edit (if any). While set, the corresponding edit's
+        # static preview is suppressed so the user sees only their editable
+        # text, not both the old static render plus the live editor.
+        self._editing_edit: EditText | None = None
 
         self._load_page(0)
 
@@ -183,6 +192,9 @@ class PageCanvas(QGraphicsView):
         self._scene.removeItem(self._overlay_group)
         self._overlay_group = self._scene.createItemGroup([])
         for edit in self._doc.edits_for_page(self._page_index):
+            if edit is self._editing_edit:
+                # Hide the static preview while the user is live-editing it.
+                continue
             self._draw_edit_preview(edit)
 
     def _draw_edit_preview(self, edit) -> None:
@@ -299,49 +311,105 @@ class PageCanvas(QGraphicsView):
         self._refresh_overlay()
         self.editAdded.emit(edit)
 
-    # --- inline text editor ----------------------------------------
+    # --- inline text editing ---------------------------------------
 
-    def show_inline_editor(self, span: list[PageChar], on_commit) -> InlineEditor:
-        """Float a QLineEdit over ``span`` styled to approximate the
-        original text. Calls ``on_commit(canvas, span, new_text)`` on
-        Enter (or focus-out); does nothing on Escape."""
+    def find_edit_at_pdf_point(self, x_pt: float, y_pt: float) -> EditText | None:
+        """Return the EditText edit on the current page whose bbox contains
+        the PDF-space point, or None. Used so clicking back on already-edited
+        text re-opens with the current text, not the original."""
+        for e in self._doc.edits:
+            if isinstance(e, EditText) and e.page == self._page_index:
+                x0, y0, x1, y1 = e.bbox
+                if x0 <= x_pt <= x1 and y0 <= y_pt <= y1:
+                    return e
+        return None
+
+    def start_inline_edit(
+        self,
+        *,
+        initial_text: str,
+        bbox_pdf: tuple[float, float, float, float],
+        fontname: str,
+        fontsize: float,
+        color: tuple[int, int, int] = (0, 0, 0),
+        existing_edit: EditText | None = None,
+        on_commit_new,   # callback(new_text: str) for creating a new edit
+    ) -> EditableTextItem:
+        """Drop an editable text item into the scene at ``bbox_pdf``.
+
+        The user can click, select, type, backspace — full text-editor
+        interaction. Enter / focus-out commits; Escape cancels.
+
+        If ``existing_edit`` is given, we're re-editing that edit: on
+        commit we mutate its ``new_text`` in place. Otherwise a new
+        EditText is created via ``on_commit_new``.
+        """
         cm = self._coord
-        scene_rect = cm.pdf_rect_to_qt(*span_bbox(span))
-        # Scene → viewport coords
-        view_poly = self.mapFromScene(scene_rect)
-        view_rect = view_poly.boundingRect()
+        rect = cm.pdf_rect_to_qt(*bbox_pdf)
+        pad = 1.0
 
-        editor = InlineEditor(self.viewport())
-        original = span_text(span)
-        editor.setText(original)
-        editor.selectAll()
-        # Match the on-screen rendered text size approximately.
-        font = editor.font()
-        h = max(12, view_rect.height())
-        font.setPixelSize(int(h * 0.72))
-        editor.setFont(font)
-        margin = 2
-        editor.setGeometry(
-            view_rect.x() - margin,
-            view_rect.y() - margin,
-            max(80, view_rect.width() + 2 * margin),
-            view_rect.height() + 2 * margin + 2,
+        # Whiteout under the editor so the original text doesn't show through.
+        whiteout = self._scene.addRect(
+            rect.x() - pad, rect.y() - pad,
+            rect.width() + 2 * pad, rect.height() + 2 * pad,
+            QPen(Qt.NoPen), QBrush(Qt.white),
         )
-        editor.show()
-        editor.raise_()
-        editor.setFocus()
+        # Subtle dashed blue border → visual cue that this frame is being edited.
+        border_pen = QPen(QColor(95, 180, 255))
+        border_pen.setStyle(Qt.DashLine)
+        border_pen.setWidthF(1.2)
+        border = self._scene.addRect(
+            rect.x() - pad, rect.y() - pad,
+            rect.width() + 2 * pad, rect.height() + 2 * pad,
+            border_pen, QBrush(Qt.NoBrush),
+        )
+
+        item = EditableTextItem()
+        self._scene.addItem(item)
+        font = _qt_font_from_pdf(fontname, fontsize * RENDER_SCALE)
+        item.setFont(font)
+        item.setDefaultTextColor(QColor(*color))
+        item.setPlainText(initial_text)
+        item.setPos(rect.x(), rect.y() - 2)
+
+        # Suppress the static preview for the edit being edited.
+        self._editing_edit = existing_edit
+        if existing_edit is not None:
+            self._refresh_overlay()
+
+        # Give it focus and select all so the user can just start typing to
+        # replace, or click to place a caret — same as Foxit.
+        item.setFocus(Qt.MouseFocusReason)
+        cursor = item.textCursor()
+        from PySide6.QtGui import QTextCursor
+        cursor.select(QTextCursor.Document)
+        item.setTextCursor(cursor)
+
+        def _cleanup() -> None:
+            for it in (item, whiteout, border):
+                try:
+                    self._scene.removeItem(it)
+                except Exception:
+                    pass
+            self._editing_edit = None
+            self._refresh_overlay()
 
         def _commit(text: str) -> None:
-            editor.deleteLater()
-            if text and text != original:
-                on_commit(self, span, text)
+            if existing_edit is not None:
+                existing_edit.new_text = text
+                self._doc.dirty = True
+                _cleanup()
+            else:
+                _cleanup()
+                if text and text != initial_text:
+                    on_commit_new(text)
 
         def _cancel() -> None:
-            editor.deleteLater()
+            _cleanup()
 
-        editor.committed.connect(_commit)
-        editor.cancelled.connect(_cancel)
-        return editor
+        item.committed.connect(_commit)
+        item.cancelled.connect(_cancel)
+        return item
 
     def resizeEvent(self, event) -> None:  # noqa: ANN001
         super().resizeEvent(event)

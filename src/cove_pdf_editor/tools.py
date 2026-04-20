@@ -39,24 +39,51 @@ class EditTextTool:
 
     def press(self, canvas: PageCanvas, qt: QPointF) -> None:
         x_pt, y_pt = canvas.coord_map().qt_to_pdf(qt)
+
+        # Re-click on already-edited text: open the editor with the CURRENT
+        # text, not the source PDF's original. Fixes "it shows old text on
+        # re-click".
+        existing = canvas.find_edit_at_pdf_point(x_pt, y_pt)
+        if existing is not None:
+            canvas.start_inline_edit(
+                initial_text=existing.new_text,
+                bbox_pdf=existing.bbox,
+                fontname=existing.fontname,
+                fontsize=existing.fontsize,
+                color=existing.color,
+                existing_edit=existing,
+                on_commit_new=lambda _t: None,
+            )
+            return
+
+        # First-time edit: locate the source text span and open the editor
+        # pre-populated with it.
         span = line_span_at(canvas.chars(), x_pt, y_pt)
         if not span:
             return
-        canvas.show_inline_editor(span, on_commit=_commit_text_edit)
+        bbox = span_bbox(span)
+        original = span_text(span)
+        fontname = span[0].fontname
+        fontsize = span[0].fontsize
+        page = canvas.page_index()
+
+        def _create(new_text: str) -> None:
+            canvas.add_edit(EditText(
+                page=page, bbox=bbox,
+                old_text=original, new_text=new_text,
+                fontname=fontname, fontsize=fontsize,
+            ))
+
+        canvas.start_inline_edit(
+            initial_text=original,
+            bbox_pdf=bbox,
+            fontname=fontname,
+            fontsize=fontsize,
+            on_commit_new=_create,
+        )
 
     def move(self, canvas, qt) -> None: pass  # noqa: D401, ANN001
     def release(self, canvas, qt) -> None: pass  # noqa: D401, ANN001
-
-
-def _commit_text_edit(canvas: PageCanvas, span, new_text: str) -> None:
-    canvas.add_edit(EditText(
-        page=canvas.page_index(),
-        bbox=span_bbox(span),
-        old_text=span_text(span),
-        new_text=new_text,
-        fontname=span[0].fontname,
-        fontsize=span[0].fontsize,
-    ))
 
 
 # ---------------------------------------------------------------------------
