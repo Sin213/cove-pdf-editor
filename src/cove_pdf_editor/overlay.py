@@ -127,9 +127,14 @@ def _draw_edit_text(c: canvas.Canvas, edit: EditText) -> None:
     c.setStrokeColorRGB(1, 1, 1)
     c.rect(x0 - pad, y0 - pad, (x1 - x0) + 2 * pad, (y1 - y0) + 2 * pad, fill=1, stroke=0)
     font = _resolve_font(edit.fontname)
-    c.setFont(font, edit.fontsize)
+    # Shrink to fit if the new text would overflow the original bbox.
+    size = edit.fontsize
+    max_w = (x1 - x0)
+    while size > 6 and c.stringWidth(edit.new_text, font, size) > max_w:
+        size -= 0.5
+    c.setFont(font, size)
     _set_fill_rgb(c, edit.color)
-    c.drawString(x0, y0 + edit.fontsize * 0.2, edit.new_text)
+    c.drawString(x0, y0 + size * 0.2, edit.new_text)
 
 
 def _draw_freetext(c: canvas.Canvas, edit: FreeText) -> None:

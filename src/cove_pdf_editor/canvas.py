@@ -19,6 +19,8 @@ from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
+    QFont,
+    QFontMetricsF,
     QImage,
     QPainter,
     QPen,
@@ -194,21 +196,26 @@ class PageCanvas(QGraphicsView):
             Stamp,
         )
         cm = self._coord
+        if isinstance(edit, EditText):
+            self._draw_edit_text_preview(edit)
+            return
         pen = QPen(QColor(100, 180, 255))
         pen.setWidth(1)
         pen.setStyle(Qt.DashLine)
-        if isinstance(edit, (EditText, FreeText, Shape, Stamp, Markup)):
+        if isinstance(edit, (FreeText, Shape, Stamp, Markup)):
             rect = cm.pdf_rect_to_qt(*edit.bbox)
             item = self._scene.addRect(rect, pen)
             self._overlay_group.addToGroup(item)
-            if isinstance(edit, EditText):
-                # Draw a translucent yellow fill so the user sees the edit mark.
-                fill = self._scene.addRect(rect, QPen(Qt.NoPen), QBrush(QColor(255, 240, 120, 80)))
-                self._overlay_group.addToGroup(fill)
-            elif isinstance(edit, Markup):
+            if isinstance(edit, Markup):
                 color = QColor(*edit.color, 110)
                 fill = self._scene.addRect(rect, QPen(Qt.NoPen), QBrush(color))
                 self._overlay_group.addToGroup(fill)
+            elif isinstance(edit, FreeText):
+                font = _qt_font_from_pdf("Helvetica", edit.fontsize * RENDER_SCALE)
+                text_item = self._scene.addSimpleText(edit.text, font)
+                text_item.setBrush(QBrush(QColor(*edit.color)))
+                text_item.setPos(rect.x() + 2, rect.y() + 2)
+                self._overlay_group.addToGroup(text_item)
         elif isinstance(edit, Ink):
             pen2 = QPen(QColor(*edit.color))
             pen2.setWidthF(edit.width * RENDER_SCALE)
@@ -227,6 +234,38 @@ class PageCanvas(QGraphicsView):
                 QPen(QColor(200, 140, 0)), QBrush(QColor(255, 220, 120)),
             )
             self._overlay_group.addToGroup(marker)
+
+    def _draw_edit_text_preview(self, edit) -> None:
+        """White out the original text on the canvas and draw the new text
+        at that position in a Qt font that approximates the captured PDF
+        font. This is what makes committed edits appear live without a save."""
+        cm = self._coord
+        rect = cm.pdf_rect_to_qt(*edit.bbox)
+        pad = 1.0
+        wo = self._scene.addRect(
+            rect.x() - pad, rect.y() - pad,
+            rect.width() + 2 * pad, rect.height() + 2 * pad,
+            QPen(Qt.NoPen), QBrush(Qt.white),
+        )
+        self._overlay_group.addToGroup(wo)
+        if not edit.new_text:
+            return
+        font = _qt_font_from_pdf(edit.fontname, edit.fontsize * RENDER_SCALE)
+        # Shrink to fit if the new text is wider than the original bbox.
+        max_w = rect.width()
+        metrics = QFontMetricsF(font)
+        size_px = float(font.pixelSize())
+        while metrics.horizontalAdvance(edit.new_text) > max_w and size_px > 6:
+            size_px -= 0.5
+            font.setPixelSize(max(6, int(size_px)))
+            metrics = QFontMetricsF(font)
+        text_item = self._scene.addSimpleText(edit.new_text, font)
+        text_item.setBrush(QBrush(QColor(*edit.color)))
+        # QGraphicsSimpleTextItem position is the top-left of the text's
+        # bounding rect. The PDF bbox top (rect.y()) lines up close enough
+        # visually; the exact offset varies by font metrics.
+        text_item.setPos(rect.x(), rect.y())
+        self._overlay_group.addToGroup(text_item)
 
     # --- tool dispatch ----------------------------------------------
 
@@ -308,3 +347,26 @@ class PageCanvas(QGraphicsView):
         super().resizeEvent(event)
         if self._scene.sceneRect().width() > 0:
             self.fitInView(self._scene.sceneRect(), Qt.KeepAspectRatio)
+
+
+def _qt_font_from_pdf(pdf_name: str, pixel_size: float) -> QFont:
+    """Map a captured PDF font name to a Qt QFont. Most PDFs use one of
+    the base-14 fonts (Helvetica / Times / Courier) or a derivative; we
+    pick the nearest Qt family by name and set bold / italic flags based
+    on the name."""
+    n = pdf_name.lower()
+    if "courier" in n or "mono" in n:
+        family = "Courier New"
+    elif "times" in n or "serif" in n:
+        family = "Times New Roman"
+    else:
+        # Helvetica, Arial, DejaVu Sans, Liberation Sans → Arial works on
+        # Windows; Linux has Liberation Sans aliased to Arial by fontconfig.
+        family = "Arial"
+    font = QFont(family)
+    font.setPixelSize(max(6, int(pixel_size)))
+    if "bold" in n or "black" in n or "heavy" in n:
+        font.setBold(True)
+    if "italic" in n or "oblique" in n:
+        font.setItalic(True)
+    return font
