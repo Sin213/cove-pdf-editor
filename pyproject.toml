@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cove-pdf-editor"
-version = "1.0.0"
+version = "1.0.1"
 description = "Offline PDF editor — edit text, annotate, sign, fill forms, and stamp pages without the cloud"
 readme = "README.md"
 requires-python = ">=3.10"

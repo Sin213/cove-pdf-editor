@@ -42,25 +42,21 @@ class EditTextTool:
         span = line_span_at(canvas.chars(), x_pt, y_pt)
         if not span:
             return
-        old = span_text(span)
-        new, ok = QInputDialog.getText(
-            canvas, "Edit text", f"Replace:",
-            QLineEdit.Normal, old,
-        )
-        if not ok or new == old:
-            return
-        bbox = span_bbox(span)
-        canvas.add_edit(EditText(
-            page=canvas.page_index(),
-            bbox=bbox,
-            old_text=old,
-            new_text=new,
-            fontname=span[0].fontname,
-            fontsize=span[0].fontsize,
-        ))
+        canvas.show_inline_editor(span, on_commit=_commit_text_edit)
 
     def move(self, canvas, qt) -> None: pass  # noqa: D401, ANN001
     def release(self, canvas, qt) -> None: pass  # noqa: D401, ANN001
+
+
+def _commit_text_edit(canvas: PageCanvas, span, new_text: str) -> None:
+    canvas.add_edit(EditText(
+        page=canvas.page_index(),
+        bbox=span_bbox(span),
+        old_text=span_text(span),
+        new_text=new_text,
+        fontname=span[0].fontname,
+        fontsize=span[0].fontsize,
+    ))
 
 
 # ---------------------------------------------------------------------------

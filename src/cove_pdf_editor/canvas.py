@@ -29,10 +29,12 @@ from PySide6.QtWidgets import (
     QGraphicsPixmapItem,
     QGraphicsScene,
     QGraphicsView,
+    QLineEdit,
+    QWidget,
 )
 
 from .document import Document
-from .render import PageChar, extract_chars, page_info, render_page
+from .render import PageChar, extract_chars, page_info, render_page, span_bbox, span_text
 
 
 RENDER_SCALE = 2.0   # pypdfium2 scale; 2.0 = 144dpi which reads crisply
@@ -67,6 +69,46 @@ class Tool(Protocol):
     def press(self, canvas: "PageCanvas", qt: QPointF) -> None: ...
     def move(self, canvas: "PageCanvas", qt: QPointF) -> None: ...
     def release(self, canvas: "PageCanvas", qt: QPointF) -> None: ...
+
+
+class InlineEditor(QLineEdit):
+    """QLineEdit positioned over a text span on the canvas. Enter commits,
+    Escape cancels. Loses focus → commit (so clicking elsewhere saves)."""
+
+    committed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setStyleSheet(
+            "QLineEdit { background: #fffacc; color: #000; "
+            "border: 1px solid #ffa000; padding: 0 2px; "
+            "selection-background-color: #4a90e2; selection-color: white; }"
+        )
+        self._done = False
+
+    def keyPressEvent(self, event) -> None:  # noqa: ANN001
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self._finalize(commit=True)
+            return
+        if event.key() == Qt.Key_Escape:
+            self._finalize(commit=False)
+            return
+        super().keyPressEvent(event)
+
+    def focusOutEvent(self, event) -> None:  # noqa: ANN001
+        super().focusOutEvent(event)
+        # Commit on blur so the user can click elsewhere to save.
+        self._finalize(commit=True)
+
+    def _finalize(self, *, commit: bool) -> None:
+        if self._done:
+            return
+        self._done = True
+        if commit:
+            self.committed.emit(self.text())
+        else:
+            self.cancelled.emit()
 
 
 class PageCanvas(QGraphicsView):
@@ -217,6 +259,50 @@ class PageCanvas(QGraphicsView):
         self._doc.add(edit)
         self._refresh_overlay()
         self.editAdded.emit(edit)
+
+    # --- inline text editor ----------------------------------------
+
+    def show_inline_editor(self, span: list[PageChar], on_commit) -> InlineEditor:
+        """Float a QLineEdit over ``span`` styled to approximate the
+        original text. Calls ``on_commit(canvas, span, new_text)`` on
+        Enter (or focus-out); does nothing on Escape."""
+        cm = self._coord
+        scene_rect = cm.pdf_rect_to_qt(*span_bbox(span))
+        # Scene → viewport coords
+        view_poly = self.mapFromScene(scene_rect)
+        view_rect = view_poly.boundingRect()
+
+        editor = InlineEditor(self.viewport())
+        original = span_text(span)
+        editor.setText(original)
+        editor.selectAll()
+        # Match the on-screen rendered text size approximately.
+        font = editor.font()
+        h = max(12, view_rect.height())
+        font.setPixelSize(int(h * 0.72))
+        editor.setFont(font)
+        margin = 2
+        editor.setGeometry(
+            view_rect.x() - margin,
+            view_rect.y() - margin,
+            max(80, view_rect.width() + 2 * margin),
+            view_rect.height() + 2 * margin + 2,
+        )
+        editor.show()
+        editor.raise_()
+        editor.setFocus()
+
+        def _commit(text: str) -> None:
+            editor.deleteLater()
+            if text and text != original:
+                on_commit(self, span, text)
+
+        def _cancel() -> None:
+            editor.deleteLater()
+
+        editor.committed.connect(_commit)
+        editor.cancelled.connect(_cancel)
+        return editor
 
     def resizeEvent(self, event) -> None:  # noqa: ANN001
         super().resizeEvent(event)
