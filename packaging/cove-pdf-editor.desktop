@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Cove PDF Editor
+GenericName=Offline PDF Editor
+Comment=Edit text, annotate, sign, and fill PDFs — fully offline
+Exec=cove-pdf-editor
+Icon=cove-pdf-editor
+Terminal=false
+Categories=Office;Utility;
+Keywords=pdf;edit;annotate;highlight;sign;form;
+StartupNotify=true
+MimeType=application/pdf;
