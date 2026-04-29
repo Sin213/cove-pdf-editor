@@ -33,3 +33,6 @@ codex-reviews/
 CLAUDE.md
 WORKFLOW.md
 RELEASES.md
+
+# Local archives / generated files
+*.zip
