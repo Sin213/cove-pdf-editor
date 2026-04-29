@@ -197,6 +197,7 @@ class MainWindow(QMainWindow):
         self._canvas: PageCanvas | None = None
         self._tool_buttons: dict[str, QPushButton] = {}
         self._build_ui()
+        self._build_menu()
         self._install_global_shortcuts()
         self.setAcceptDrops(True)
         self._updater = updater.UpdateController(
@@ -214,27 +215,19 @@ class MainWindow(QMainWindow):
         self._status = QStatusBar()
         self.setStatusBar(self._status)
 
-        # Top toolbar with open/save
-        bar = QToolBar()
-        bar.setMovable(False)
-        bar.setStyleSheet("QToolBar { background:#14181f; border-bottom:1px solid #2a2f3a; padding:4px; }")
-        self.addToolBar(bar)
-        open_act = QAction("Open PDF…", self)
-        open_act.setShortcut(QKeySequence.Open)
-        open_act.setToolTip("Open a PDF (Ctrl+O)")
-        open_act.triggered.connect(self._on_open)
-        bar.addAction(open_act)
+        self._open_act = QAction("Open PDF…", self)
+        self._open_act.setShortcut(QKeySequence.Open)
+        self._open_act.setToolTip("Open a PDF (Ctrl+O)")
+        self._open_act.triggered.connect(self._on_open)
         self._save_act = QAction("Save As…", self)
         self._save_act.setShortcut(QKeySequence.Save)
         self._save_act.setToolTip("Save the edited PDF (Ctrl+S)")
         self._save_act.setEnabled(False)
         self._save_act.triggered.connect(self._on_save)
-        bar.addAction(self._save_act)
 
-        # Formatting toolbar (second row, hidden until a text object is selected).
-        self.addToolBarBreak()
+        # Formatting toolbar (hidden until a text object is selected).
         self._fmt_bar = self._build_format_bar()
-        self.addToolBar(self._fmt_bar)
+        self.addToolBar(Qt.TopToolBarArea, self._fmt_bar)
         self._fmt_bar.setVisible(False)
         self._selected_edit: FreeText | None = None
 
@@ -317,6 +310,58 @@ class MainWindow(QMainWindow):
         root.addWidget(self._canvas_stack, stretch=1)
 
         self._update_tool_enabled(False)
+
+    # --------------------------------------------------------- menu
+
+    def _build_menu(self) -> None:
+        self.menuBar().setNativeMenuBar(False)
+        self.menuBar().setStyleSheet(
+            "QMenuBar { background:#14181f; color:#cfd0d4; border-bottom:1px solid #2a2f3a; }"
+            "QMenuBar::item:selected { background:#1f3a5c; }"
+            "QMenu { background:#1a1f2b; color:#cfd0d4; border:1px solid #2a2f3a; }"
+            "QMenu::item:selected { background:#1f3a5c; }"
+            "QMenu::item:disabled { color:#5a616f; }"
+            "QMenu::separator { background:#2a2f3a; height:1px; margin:4px 8px; }"
+        )
+        file_menu = self.menuBar().addMenu("&File")
+
+        self._new_act = QAction("&New…", self)
+        self._new_act.setShortcut(QKeySequence.New)
+        self._new_act.setEnabled(False)
+        file_menu.addAction(self._new_act)
+
+        file_menu.addAction(self._open_act)
+
+        file_menu.addSeparator()
+
+        self._save_menu_act = QAction("&Save", self)
+        self._save_menu_act.setEnabled(False)
+        file_menu.addAction(self._save_menu_act)
+
+        file_menu.addAction(self._save_act)
+
+        file_menu.addSeparator()
+
+        export_menu = file_menu.addMenu("E&xport")
+        self._export_current_act = QAction("Current Page as PDF…", self)
+        self._export_current_act.setEnabled(False)
+        export_menu.addAction(self._export_current_act)
+        self._export_selected_act = QAction("Selected Pages as PDF…", self)
+        self._export_selected_act.setEnabled(False)
+        export_menu.addAction(self._export_selected_act)
+
+        file_menu.addSeparator()
+
+        self._close_act = QAction("Close PDF", self)
+        self._close_act.setEnabled(False)
+        file_menu.addAction(self._close_act)
+
+        file_menu.addSeparator()
+
+        exit_act = QAction("E&xit", self)
+        exit_act.setShortcut(QKeySequence.Quit)
+        exit_act.triggered.connect(self.close)
+        file_menu.addAction(exit_act)
 
     # --------------------------------------------------------- file ops
 
