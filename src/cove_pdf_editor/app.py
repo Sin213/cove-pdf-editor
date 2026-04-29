@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QListWidget,
     QListWidgetItem,
@@ -40,7 +41,7 @@ from PySide6.QtWidgets import (
 from . import __version__, updater
 from .canvas import PageCanvas
 from .document import Document, FreeText
-from .overlay import save
+from .overlay import export_pages, save
 from .tools import (
     AddImageTool,
     EditTextTool,
@@ -345,9 +346,11 @@ class MainWindow(QMainWindow):
         export_menu = file_menu.addMenu("E&xport")
         self._export_current_act = QAction("Current Page as PDF…", self)
         self._export_current_act.setEnabled(False)
+        self._export_current_act.triggered.connect(self._on_export_current)
         export_menu.addAction(self._export_current_act)
         self._export_selected_act = QAction("Selected Pages as PDF…", self)
         self._export_selected_act.setEnabled(False)
+        self._export_selected_act.triggered.connect(self._on_export_selected)
         export_menu.addAction(self._export_selected_act)
 
         file_menu.addSeparator()
@@ -442,6 +445,8 @@ class MainWindow(QMainWindow):
         self._status.showMessage(f"{path.name} • {n} page(s)", 6000)
         self._update_tool_enabled(True)
         self._save_act.setEnabled(True)
+        self._export_current_act.setEnabled(True)
+        self._export_selected_act.setEnabled(True)
         # The formatting toolbar is now part of the standard surface — show
         # it for the rest of the session and toggle controls based on what
         # is selected, instead of hiding the whole bar.
@@ -469,6 +474,91 @@ class MainWindow(QMainWindow):
             return
         self._doc.dirty = False
         self._status.showMessage(f"Saved {Path(path).name}", 8000)
+
+    # ------------------------------------------------------- export ops
+
+    @staticmethod
+    def _parse_page_range(text: str, page_count: int) -> list[int]:
+        pages: list[int] = []
+        for part in text.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                lo, hi = part.split("-", 1)
+                lo_i, hi_i = int(lo), int(hi)
+                if lo_i < 1 or hi_i < lo_i or hi_i > page_count:
+                    raise ValueError(f"Invalid range: {part}")
+                pages.extend(range(lo_i - 1, hi_i))
+            else:
+                p = int(part)
+                if p < 1 or p > page_count:
+                    raise ValueError(f"Page {p} out of range (1–{page_count})")
+                pages.append(p - 1)
+        if not pages:
+            raise ValueError("No pages specified")
+        seen: set[int] = set()
+        result: list[int] = []
+        for p in pages:
+            if p not in seen:
+                seen.add(p)
+                result.append(p)
+        return result
+
+    def _on_export_current(self) -> None:
+        if self._doc is None or self._canvas is None:
+            return
+        idx = self._canvas.page_index()
+        default = str(
+            self._doc.source.with_name(
+                f"{self._doc.source.stem}-page{idx + 1}.pdf"
+            )
+        )
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Current Page", default, "PDF (*.pdf);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            export_pages(self._doc, [idx], Path(path))
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Export failed", str(exc))
+            return
+        self._status.showMessage(f"Exported page {idx + 1} → {Path(path).name}", 8000)
+
+    def _on_export_selected(self) -> None:
+        if self._doc is None:
+            return
+        n = self._doc.page_count
+        text, ok = QInputDialog.getText(
+            self,
+            "Export Selected Pages",
+            f"Page range (1–{n}), e.g. 1-3,5,8-10:",
+        )
+        if not ok or not text.strip():
+            return
+        try:
+            pages = self._parse_page_range(text, n)
+        except (ValueError, TypeError) as exc:
+            QMessageBox.warning(self, "Invalid page range", str(exc))
+            return
+        default = str(
+            self._doc.source.with_name(
+                f"{self._doc.source.stem}-pages.pdf"
+            )
+        )
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Selected Pages", default, "PDF (*.pdf);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            export_pages(self._doc, pages, Path(path))
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Export failed", str(exc))
+            return
+        labels = text.strip()
+        self._status.showMessage(f"Exported pages {labels} → {Path(path).name}", 8000)
 
     # --------------------------------------------------------- tool ops
 
