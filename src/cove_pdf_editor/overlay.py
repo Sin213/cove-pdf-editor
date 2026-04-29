@@ -12,6 +12,7 @@ produces those.
 """
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
 
 import pymupdf
@@ -231,3 +232,19 @@ def _resolve_font(name: str, bold: bool = False, italic: bool = False) -> str:
             else "Helvetica-Bold" if bold
             else "Helvetica-Oblique" if italic
             else "Helvetica")
+
+
+def export_pages(doc: Document, pages: list[int], out: Path) -> None:
+    """Export specific pages (0-based indices) with all edits baked in."""
+    tmp_fd, tmp_name = tempfile.mkstemp(suffix=".pdf")
+    tmp_path = Path(tmp_name)
+    try:
+        import os
+        os.close(tmp_fd)
+        save(doc, tmp_path)
+        pdf = pymupdf.open(str(tmp_path))
+        pdf.select(pages)
+        pdf.save(str(out), garbage=4, deflate=True)
+        pdf.close()
+    finally:
+        tmp_path.unlink(missing_ok=True)
