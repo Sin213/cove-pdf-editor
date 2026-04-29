@@ -321,24 +321,38 @@ class MainWindow(QMainWindow):
     # --------------------------------------------------------- file ops
 
     def _install_global_shortcuts(self) -> None:
-        """Install Undo/Redo as application-wide ``QShortcut``s. Earlier
-        we used ``QAction`` with ``Qt.ApplicationShortcut``, but on some
-        Linux window managers the QAction shortcut path didn't fire
-        ``triggered`` reliably — particularly for Ctrl+Y. ``QShortcut``
-        binds at the Qt shortcut-event layer directly and fires
-        regardless of which child widget has focus."""
-        from PySide6.QtGui import QShortcut
+        """Install Undo/Redo as ``QAction``s on the MainWindow.
 
-        def add(seq: str, handler) -> "QShortcut":  # noqa: ANN001
-            sh = QShortcut(QKeySequence(seq), self)
-            sh.setContext(Qt.ApplicationShortcut)
-            sh.activated.connect(handler)
-            return sh
+        One ``QAction`` per logical action with all bindings attached at
+        once, instead of multiple ``QShortcut``s. Two separate shortcut
+        objects each claiming Ctrl+Shift+Z collide with
+        ``QGraphicsTextItem``'s built-in text-redo action — Qt resolves
+        ``QKeySequence::Redo`` on Linux to both Ctrl+Y *and*
+        Ctrl+Shift+Z, so the shortcut map sees the same combo claimed
+        twice and prints "Ambiguous shortcut overload: Ctrl+Shift+Z".
+        Folding everything into one QAction per logical action removes
+        that competing-on-our-side registration.
 
-        self._sc_undo = add("Ctrl+Z", self._do_undo)
-        # Bind both common Redo bindings explicitly.
-        self._sc_redo_y = add("Ctrl+Y", self._do_redo)
-        self._sc_redo_shift_z = add("Ctrl+Shift+Z", self._do_redo)
+        ``Qt.WindowShortcut`` (default for QActions) scopes the binding
+        to MainWindow + descendants, so it fires from the canvas, the
+        sidebar, the format toolbar, and the page list — but doesn't
+        compete app-wide with other windows / standard-key actions.
+        """
+        self._undo_act = QAction("Undo", self)
+        self._undo_act.setShortcut(QKeySequence("Ctrl+Z"))
+        self._undo_act.setShortcutContext(Qt.WindowShortcut)
+        self._undo_act.triggered.connect(self._do_undo)
+        self.addAction(self._undo_act)
+
+        # ONE QAction with BOTH redo bindings — no competing registrations.
+        self._redo_act = QAction("Redo", self)
+        self._redo_act.setShortcuts([
+            QKeySequence("Ctrl+Y"),
+            QKeySequence("Ctrl+Shift+Z"),
+        ])
+        self._redo_act.setShortcutContext(Qt.WindowShortcut)
+        self._redo_act.triggered.connect(self._do_redo)
+        self.addAction(self._redo_act)
 
     def _do_undo(self) -> None:
         if self._canvas is not None:
