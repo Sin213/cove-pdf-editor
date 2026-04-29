@@ -1,8 +1,8 @@
 # Cove PDF Editor
 
-An offline PDF editor for **Linux** and **Windows**. The everyday edits
-most people pay Foxit or Acrobat for — in a focused desktop app that
-never touches the cloud.
+A focused offline PDF editor for **Linux** and **Windows**. Edit
+existing PDF text, add new text, drop images onto pages, save. Never
+touches the cloud.
 
 ## Download (v1.0.0)
 https://github.com/Sin213/cove-pdf-editor
@@ -17,41 +17,64 @@ Grab the artifacts from the [Releases page](https://github.com/Sin213/cove-pdf-e
 
 ## The flagship: Edit Text
 
-Click any text on the page. An inline editor appears with the existing
-text pre-filled and the detected font + size remembered. Hit Enter and
-the original text is replaced in-place, using the same font so it looks
-native. This is the "quick invoice fix" use case — not full multi-line
-paragraph reflow, but it nails the common cases.
+**Double-click** any searchable text on the page. An inline editor opens
+with the original text pre-filled and the detected font, size, bold,
+and italic remembered. Hit Enter and the original glyphs are *removed*
+from the PDF (not just visually covered) and replaced with your text in
+the same place, at approximately the same font and size. This is the
+"quick invoice fix" use case — not full multi-line paragraph reflow,
+but it nails the common cases.
 
 Works best on accounting-software / office PDFs with clean, searchable
 text. Scanned PDFs need OCR first (use a separate tool like `cove-ocr`),
 and some design-tool exports convert text to vector outlines which can't
 be edited as text.
 
-## Everything else
+## Features
 
-**Annotations:** highlight, strikethrough, underline; sticky notes; free
-text boxes; rectangles, circles, lines, arrows; freehand ink drawing.
-
-**Stamps & signatures:** drop any PNG/JPG as a stamp; hand-drawn
-signatures via a small canvas dialog, saved as a reusable stamp.
-
-**Forms:** fill in AcroForm fields (the common kind). No XFA — that's
-largely deprecated.
-
-**Page extras:** headers, footers, page numbers, watermarks (text with
-rotation/opacity), bookmarks, hyperlinks.
-
-**Save options:**
-- **Preserve** — annotations stay as layered PDF objects, which readers
-  can toggle independently. Editable later.
-- **Flatten** — everything bakes into the page content. The edits travel
-  with the file no matter which reader opens it.
+- **Open PDF** — local files only; drag-and-drop a PDF onto the window.
+- **Page navigation** — sidebar page list.
+- **Select** — click any added text or image to select; drag to move,
+  drag the corner/edge handles to resize, **Delete** to remove,
+  **Esc** to deselect.
+- **Edit Text** — *double-click* any searchable text run; the original
+  glyphs are removed and replaced in-place at the same approximate font
+  and size. If the click misses any text, the status bar tells you.
+- **Add Text** — drag a rectangle, type, **Enter** to commit. The new
+  text box stays selectable, movable, resizable, and double-click
+  re-editable.
+- **Text Plus** — single-click anywhere to drop a small editable text
+  entry. The tool stays active for repeated clicks — handy for filling
+  print-only forms one field after another.
+- **Add Image** — pick a PNG / JPG, drag a rectangle, the image stretches
+  to fill it. Resizable / movable / deletable like a text object.
+- **Formatting toolbar** — appears whenever a text object is selected:
+  font family, size, bold, italic, underline, color, and alignment.
+  Changes apply immediately; saved output preserves them.
+- **Save** — bakes every edit into a clean PDF that opens in any reader.
+  No annotation layer, no extra metadata, no cloud round-trips.
 
 ## Requirements
 
-- `ffmpeg` not needed. No ML models. No internet at runtime.
+- No ML models. No internet at runtime.
 - Python 3.10+ to run from source.
+
+## Fonts
+
+Cove's formatting toolbar shows a curated list of common text fonts —
+the PDF base-14 (Helvetica, Times, Courier) plus standard cross-platform
+fonts (Arial, Times New Roman, Calibri, Cambria, Georgia, Verdana,
+Tahoma) and open-source families (Liberation, DejaVu, Noto, Carlito,
+Caladea, Tinos, Cousine, Arimo). Friendly names are mapped to whatever
+compatible family is actually installed on your system.
+
+**Cove does not bundle proprietary Microsoft fonts.** For Microsoft
+fonts on Linux, install them through your system package manager —
+e.g. `ttf-ms-fonts` on Arch / EOS — subject to Microsoft's own
+licensing terms. If the Microsoft font isn't installed, Cove
+substitutes a metric-compatible open-source family (Liberation Sans
+for Arial, Liberation Serif for Times New Roman, Carlito for Calibri,
+Caladea for Cambria, etc.).
 
 ## Running from source
 
@@ -84,9 +107,9 @@ attaches them to a release.
 
 ## Known limits
 
-- No true in-place paragraph text editing (the single thing Foxit owns).
-  Our Edit Text tool uses an overlay technique — works great for
-  short replacements at the original font/size, doesn't reflow.
+- No true in-place paragraph text editing. The Edit Text tool uses an
+  overlay technique — works great for short replacements at the original
+  font/size, doesn't reflow.
 - No OCR for scanned PDFs (separate app).
 - Font fallback: if the captured font name isn't in reportlab's standard
   set, we pick the closest visual match. Usually imperceptible; for

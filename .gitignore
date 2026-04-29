@@ -24,3 +24,12 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# Local AI/audit scratch files
+.audit/
+codex-reviews/
+
+# Personal agent / workflow config
+CLAUDE.md
+WORKFLOW.md
+RELEASES.md

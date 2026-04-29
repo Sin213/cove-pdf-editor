@@ -5,18 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cove-pdf-editor"
 version = "1.1.0"
-description = "Offline PDF editor — edit text, annotate, sign, fill forms, and stamp pages without the cloud"
+description = "Focused offline PDF editor for editing text and adding images"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Cove" }]
 dependencies = [
     "PySide6>=6.6",
-    "pypdf>=5.0",
-    "pikepdf>=9.0",
     "pypdfium2>=5.0",
-    "pdfplumber>=0.11",
-    "reportlab>=4.0",
+    "pymupdf>=1.24",
     "Pillow>=10.0",
 ]
 

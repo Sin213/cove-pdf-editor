@@ -1,37 +1,56 @@
-"""Page rendering + text extraction.
+"""Page rendering + text-span extraction.
 
-pypdfium2 does the rendering; pdfplumber does the positional text
-extraction for Edit Text + text-markup tools. Everything runs on the
-main thread for simplicity (most PDFs render a page in <100ms at
-screen scale). If that proves slow for large pages we can move
-rendering to a worker later.
+Rendering goes through pypdfium2 for the bitmap. Searchable text spans
+come from PyMuPDF, which gives us a per-span bbox + font + size + flags
+in one pass — exactly what double-click text editing needs.
+
+If the PDF is image-only (a scan with no extractable text layer),
+``extract_spans`` simply returns an empty list and clicks fall through
+to a "no editable text here" message at the tool layer.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
 
-import pdfplumber
+import pymupdf
 import pypdfium2 as pdfium
 from PIL import Image
 from PySide6.QtGui import QImage
 
 
+# PyMuPDF font flag bits (matches mupdf docs).
+_FLAG_ITALIC = 1 << 1
+_FLAG_BOLD = 1 << 4
+
+
 @dataclass(frozen=True)
-class PageChar:
+class PageSpan:
     text: str
-    x0: float
-    y0: float       # from page bottom (PDF convention)
-    x1: float
-    y1: float
+    bbox: tuple[float, float, float, float]  # PDF points, bottom-left origin
     fontname: str
     fontsize: float
+    color: tuple[int, int, int]
+    bold: bool
+    italic: bool
 
 
 @dataclass(frozen=True)
 class PageInfo:
     width: float    # points
     height: float   # points
+
+
+@dataclass(frozen=True)
+class PageImage:
+    """An image XObject placed on a source PDF page. Bbox in PDF points
+    (bottom-left origin). ``image_bytes`` holds the raw image file
+    contents (PNG / JPEG / etc.) so we can write it to a temp file and
+    treat it like any other inserted image."""
+    bbox: tuple[float, float, float, float]
+    xref: int
+    image_bytes: bytes
+    ext: str
 
 
 def page_info(source: Path, page_index: int) -> PageInfo:
@@ -47,110 +66,90 @@ def render_page(source: Path, page_index: int, scale: float = 2.0) -> QImage:
         return _pil_to_qimage(pil)
 
 
-def extract_chars(source: Path, page_index: int) -> list[PageChar]:
-    """Per-character bounding box info. Coordinates in PDF points,
-    origin bottom-left."""
-    out: list[PageChar] = []
-    with pdfplumber.open(source) as pdf:
-        page = pdf.pages[page_index]
-        for c in page.chars:
-            out.append(PageChar(
-                text=c.get("text", ""),
-                x0=float(c.get("x0", 0)),
-                y0=float(c.get("y0", 0)),
-                x1=float(c.get("x1", 0)),
-                y1=float(c.get("y1", 0)),
-                fontname=str(c.get("fontname", "Helvetica")),
-                fontsize=float(c.get("size", 11.0)),
-            ))
+def extract_spans(source: Path, page_index: int) -> list[PageSpan]:
+    """Per-span text + style info, with bboxes in PDF points (bottom-left
+    origin) so they line up with everything else in :class:`Document`."""
+    out: list[PageSpan] = []
+    with pymupdf.open(str(source)) as doc:
+        page = doc[page_index]
+        page_h = page.rect.height
+        for block in page.get_text("dict")["blocks"]:
+            if block.get("type") != 0:  # 0 = text block, 1 = image
+                continue
+            for line in block.get("lines", []):
+                for s in line.get("spans", []):
+                    text = s.get("text", "")
+                    if not text.strip():
+                        continue  # whitespace-only spans — nothing to edit
+                    x0, y_top, x1, y_bot = s["bbox"]
+                    # MuPDF bbox is top-left origin; flip to PDF convention.
+                    bbox = (x0, page_h - y_bot, x1, page_h - y_top)
+                    color_int = int(s.get("color", 0))
+                    color = (
+                        (color_int >> 16) & 0xFF,
+                        (color_int >> 8) & 0xFF,
+                        color_int & 0xFF,
+                    )
+                    flags = int(s.get("flags", 0))
+                    out.append(PageSpan(
+                        text=text,
+                        bbox=bbox,
+                        fontname=str(s.get("font", "Helvetica")),
+                        fontsize=float(s.get("size", 11.0)),
+                        color=color,
+                        bold=bool(flags & _FLAG_BOLD),
+                        italic=bool(flags & _FLAG_ITALIC),
+                    ))
     return out
 
 
-def word_span_at(chars: list[PageChar], x: float, y: float) -> list[PageChar] | None:
-    """Given PDF-space coords (points, bottom-left origin), return the
-    list of chars forming the word or contiguous text run under that point.
-    We expand left/right as long as the next char is on the same baseline
-    and separated by less than one space-width.
-    """
-    # Find the char whose bbox contains (x, y). Note y0 is bottom.
-    hit = None
-    for i, c in enumerate(chars):
-        if c.x0 <= x <= c.x1 and c.y0 <= y <= c.y1:
-            hit = i
-            break
-    if hit is None:
-        return None
-    # Walk left and right to build a run on the same baseline. We treat
-    # anything on roughly the same y0 (within half font size) as part of
-    # the same line; we break on whitespace if the gap is big.
-    line_tol = max(1.0, chars[hit].fontsize * 0.4)
-    # Sort by x0 on the same line to find neighbors
-    line = [c for c in chars if abs(c.y0 - chars[hit].y0) <= line_tol]
-    line.sort(key=lambda c: c.x0)
-    # locate hit in sorted line
-    hit_ref = chars[hit]
-    try:
-        hit_idx = line.index(hit_ref)
-    except ValueError:
-        return [hit_ref]
-    # Walk left / right stopping when gap > half-em (treat as word boundary)
-    gap_tol = hit_ref.fontsize * 0.4
-    start = hit_idx
-    while start > 0:
-        prev = line[start - 1]
-        curr = line[start]
-        if curr.x0 - prev.x1 > gap_tol:
-            break
-        start -= 1
-    end = hit_idx
-    while end < len(line) - 1:
-        curr = line[end]
-        nxt = line[end + 1]
-        if nxt.x0 - curr.x1 > gap_tol:
-            break
-        end += 1
-    return line[start:end + 1]
-
-
-def line_span_at(chars: list[PageChar], x: float, y: float) -> list[PageChar] | None:
-    """Full line under the point (ignores word boundaries). Good for
-    Edit Text where you usually want to edit a whole label like
-    ``TOTAL DUE: $1,000.00``."""
-    line_tol = 6.0  # points
-    # Find any char on the clicked line.
-    on_line = [c for c in chars if c.y0 - line_tol <= y <= c.y1 + line_tol]
-    if not on_line:
-        return None
-    on_line.sort(key=lambda c: c.x0)
-    # Group into contiguous runs on this line; return the run containing x.
-    runs: list[list[PageChar]] = []
-    current: list[PageChar] = []
-    prev: PageChar | None = None
-    for c in on_line:
-        gap_tol = c.fontsize * 2.0
-        if prev is not None and c.x0 - prev.x1 > gap_tol:
-            runs.append(current)
-            current = []
-        current.append(c)
-        prev = c
-    if current:
-        runs.append(current)
-    for run in runs:
-        if run[0].x0 - 2.0 <= x <= run[-1].x1 + 2.0:
-            return run
+def span_at(spans: list[PageSpan], x: float, y: float) -> PageSpan | None:
+    """Return the span whose bbox contains the PDF-space point, or None."""
+    for span in spans:
+        x0, y0, x1, y1 = span.bbox
+        if x0 <= x <= x1 and y0 <= y <= y1:
+            return span
     return None
 
 
-def span_bbox(span: list[PageChar]) -> tuple[float, float, float, float]:
-    x0 = min(c.x0 for c in span)
-    y0 = min(c.y0 for c in span)
-    x1 = max(c.x1 for c in span)
-    y1 = max(c.y1 for c in span)
-    return x0, y0, x1, y1
+def extract_images(source: Path, page_index: int) -> list[PageImage]:
+    """Per-image XObject info on the page: bbox in PDF points, xref, and
+    the raw image bytes. Used to make existing PDF images promotable
+    into editable :class:`document.ImageEdit` objects."""
+    out: list[PageImage] = []
+    seen_xrefs: dict[int, dict] = {}
+    with pymupdf.open(str(source)) as doc:
+        page = doc[page_index]
+        page_h = page.rect.height
+        for entry in page.get_images(full=True):
+            xref = entry[0]
+            if xref not in seen_xrefs:
+                try:
+                    seen_xrefs[xref] = doc.extract_image(xref)
+                except Exception:
+                    continue
+            data = seen_xrefs[xref]
+            for rect in page.get_image_rects(xref):
+                # MuPDF rect → PDF coords (bottom-left origin).
+                bbox = (rect.x0, page_h - rect.y1, rect.x1, page_h - rect.y0)
+                out.append(PageImage(
+                    bbox=bbox,
+                    xref=xref,
+                    image_bytes=data.get("image", b""),
+                    ext=str(data.get("ext", "png")),
+                ))
+    return out
 
 
-def span_text(span: list[PageChar]) -> str:
-    return "".join(c.text for c in span)
+def image_at(images: list[PageImage], x: float, y: float) -> PageImage | None:
+    """Return the topmost image whose bbox contains the PDF-space point.
+    Topmost = last one in extraction order, which is render order."""
+    hit: PageImage | None = None
+    for img in images:
+        x0, y0, x1, y1 = img.bbox
+        if x0 <= x <= x1 and y0 <= y <= y1:
+            hit = img
+    return hit
 
 
 def _pil_to_qimage(img: Image.Image) -> QImage:
