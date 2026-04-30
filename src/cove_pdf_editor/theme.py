@@ -51,6 +51,7 @@ FONT_STACK = (
     '"Inter", "Segoe UI", "SF Pro Text", "Helvetica Neue", '
     '"DejaVu Sans", system-ui, sans-serif'
 )
+FONT_MONO = "Geist Mono"
 
 # ---------------------------------------------------------- canvas colors
 #

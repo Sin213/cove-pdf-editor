@@ -16,7 +16,11 @@ from PySide6.QtGui import (
     QFontDatabase,
     QIcon,
     QKeySequence,
+    QMouseEvent,
+    QPainter,
+    QPixmap,
 )
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QButtonGroup,
     QColorDialog,
@@ -43,6 +47,7 @@ from PySide6.QtWidgets import (
 
 from . import __version__, theme, updater
 from .canvas import PageCanvas
+from .chrome import CoveTitleBar, FramelessResizer
 from .document import Document, FreeText
 from .overlay import export_pages, save
 from .tools import (
@@ -56,6 +61,23 @@ from .tools import (
 
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 ICON_PATH = ASSETS_DIR / "cove_icon.png"
+
+_CURSOR_SVG_TMPL = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+    '<path d="M5 3l14 9-6.5 1.5L16 21l-3 1.5-3.5-7.5L4 18z"'
+    ' fill="{color}"/></svg>'
+)
+
+
+def _cursor_pixmap(color: str, size: int = 18) -> QPixmap:
+    svg_bytes = _CURSOR_SVG_TMPL.format(color=color).encode()
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    renderer = QSvgRenderer(svg_bytes)
+    p = QPainter(pm)
+    renderer.render(p)
+    p.end()
+    return pm
 
 
 # Curated font list shown at the top of the format-bar Family combo.
@@ -181,6 +203,9 @@ class MainWindow(QMainWindow):
         self.resize(1300, 820)
         if ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(ICON_PATH)))
+        self.setWindowFlags(self.windowFlags() | Qt.FramelessWindowHint)
+        self._frameless_resizer = FramelessResizer(self)
+        self.setMouseTracking(True)
         # Single source of truth for the app-shell look. Per-widget
         # setStyleSheet calls are intentionally avoided so this sheet
         # drives the entire chrome.
@@ -236,6 +261,15 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
+        # 0. Custom titlebar (frameless chrome).
+        self._titlebar = CoveTitleBar(
+            self,
+            icon_path=str(ICON_PATH) if ICON_PATH.exists() else None,
+            title="Cove PDF Editor",
+            version=f"v{__version__}",
+        )
+        outer.addWidget(self._titlebar)
+
         # 1. Menu bar.
         self._menubar = QMenuBar()
         self._menubar.setNativeMenuBar(False)
@@ -283,7 +317,7 @@ class MainWindow(QMainWindow):
         self._tool_group = QButtonGroup(self)
         self._tool_group.setExclusive(True)
         for icon, name, hot, key, factory, tip in (
-            ("👆", "Select",    "V",  "select",    SelectTool,
+            (None, "Select",    "V",  "select",    SelectTool,
              "Select objects to move, resize, or delete"),
             ("📝", "Edit Text", "E",  "edit_text", EditTextTool,
              "Double-click searchable PDF text to replace it"),
@@ -371,9 +405,14 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(10, 0, 10, 0)
         lay.setSpacing(11)
 
-        ico_lbl = QLabel(icon)
+        ico_lbl = QLabel()
         ico_lbl.setObjectName("ToolIcon")
         ico_lbl.setAttribute(Qt.WA_TransparentForMouseEvents)
+        if icon is None:
+            ico_lbl.setPixmap(_cursor_pixmap(theme.TEXT_DIM))
+            ico_lbl.setProperty("_cursor_svg", True)
+        else:
+            ico_lbl.setText(icon)
         name_lbl = QLabel(name)
         name_lbl.setObjectName("ToolName")
         name_lbl.setAttribute(Qt.WA_TransparentForMouseEvents)
@@ -403,6 +442,9 @@ class MainWindow(QMainWindow):
                 child.setProperty("active", flag)
                 child.style().unpolish(child)
                 child.style().polish(child)
+                if child.property("_cursor_svg"):
+                    color = theme.ACCENT if active else theme.TEXT_DIM
+                    child.setPixmap(_cursor_pixmap(color))
 
     def _build_pages_empty(self) -> QFrame:
         card = QFrame()
@@ -1295,6 +1337,30 @@ class MainWindow(QMainWindow):
                 self._load(Path(p))
                 event.acceptProposedAction()
                 return
+
+    # ----------------------------------------------- frameless resize
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if self._frameless_resizer.try_press(event):
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._frameless_resizer.try_move(event):
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if self._frameless_resizer.try_release(event):
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: ANN001
+        self._frameless_resizer.clear_hover()
+        super().leaveEvent(event)
 
 
 class _StatusShim:
