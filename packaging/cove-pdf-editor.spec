@@ -14,9 +14,8 @@ a = Analysis(
         (str(ASSETS / "cove_icon.png"), "cove_pdf_editor/assets"),
     ],
     hiddenimports=[
-        "pdfplumber",
-        "pdfminer.six",
-        "reportlab.rl_settings",
+        "pymupdf",
+        "pymupdf._mupdf",
     ],
     hookspath=[],
     runtime_hooks=[],

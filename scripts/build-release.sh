@@ -7,7 +7,8 @@ cd "$ROOT"
 
 APP_NAME="cove-pdf-editor"
 DISPLAY_NAME="Cove PDF Editor"
-VERSION="${VERSION:-1.0.3}"
+APP_SLUG="Cove-PDF-Editor"
+VERSION="${VERSION:-2.0.0}"
 ARCH="x86_64"
 DEB_ARCH="amd64"
 RELEASE_DIR="$ROOT/release"
@@ -19,12 +20,20 @@ ICON_SRC="$ROOT/src/cove_pdf_editor/assets/cove_icon.png"
 LOCAL_BIN="${HOME}/.local/bin"
 APPIMAGETOOL="${LOCAL_BIN}/appimagetool"
 
+BUILDENV="$ROOT/.buildenv"
+
 mkdir -p "$RELEASE_DIR" "$LOCAL_BIN"
 rm -rf "$DIST_DIR" "$ROOT/build"
 mkdir -p "$ROOT/build"
 
+echo "==> Creating build venv"
+rm -rf "$BUILDENV"
+python -m venv "$BUILDENV"
+"$BUILDENV/bin/pip" install --quiet --upgrade pip
+"$BUILDENV/bin/pip" install --quiet PySide6 pymupdf pypdfium2 Pillow pyinstaller
+
 echo "==> Running PyInstaller"
-python -m PyInstaller --noconfirm --clean packaging/cove-pdf-editor.spec
+"$BUILDENV/bin/python" -m PyInstaller --noconfirm --clean packaging/cove-pdf-editor.spec
 
 BUNDLE="$DIST_DIR/$APP_NAME"
 [ -d "$BUNDLE" ] || { echo "PyInstaller bundle not found at $BUNDLE"; exit 1; }
@@ -83,7 +92,7 @@ if [ ! -x "$APPIMAGETOOL" ]; then
 fi
 
 echo "==> Building AppImage"
-APPIMAGE_OUT="$RELEASE_DIR/${DISPLAY_NAME// /-}-${VERSION}-${ARCH}.AppImage"
+APPIMAGE_OUT="$RELEASE_DIR/${APP_SLUG}-${VERSION}-${ARCH}.AppImage"
 ARCH=$ARCH "$APPIMAGETOOL" --no-appstream "$APPDIR" "$APPIMAGE_OUT"
 chmod +x "$APPIMAGE_OUT"
 echo "    -> $APPIMAGE_OUT"
@@ -142,7 +151,7 @@ Description: Offline PDF editor — edit text, annotate, sign, fill forms
 EOF
 
 echo "==> Building .deb archive"
-DEB_OUT="$RELEASE_DIR/${APP_NAME}_${VERSION}_${DEB_ARCH}.deb"
+DEB_OUT="$RELEASE_DIR/${APP_SLUG}-${VERSION}-${DEB_ARCH}.deb"
 WORK="$DEB_BUILD/work"
 rm -rf "$WORK"
 mkdir -p "$WORK"
@@ -158,6 +167,8 @@ echo "" >> "$WORK/debian-binary"
 (cd "$WORK" && ar -rc "$DEB_OUT" debian-binary control.tar.xz data.tar.xz)
 
 echo "    -> $DEB_OUT"
+
+rm -rf "$BUILDENV" "$DIST_DIR" "$ROOT/build"
 
 echo ""
 echo "Release artifacts:"

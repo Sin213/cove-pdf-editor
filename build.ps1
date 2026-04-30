@@ -13,6 +13,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $App        = "cove-pdf-editor"
+$AppSlug    = "Cove-PDF-Editor"
 $ReleaseDir = "release"
 
 function Step([string]$msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
@@ -24,7 +25,7 @@ if (Test-Path .buildenv) { Remove-Item -Recurse -Force .buildenv }
 python -m venv .buildenv
 & .\.buildenv\Scripts\python.exe -m pip install --quiet --upgrade pip
 & .\.buildenv\Scripts\python.exe -m pip install --quiet `
-    PySide6 Pillow pypdf pikepdf pypdfium2 pdfplumber reportlab pyinstaller
+    PySide6 pymupdf pypdfium2 Pillow pyinstaller
 
 Step "[2/5] Generating cove_icon.ico"
 & .\.buildenv\Scripts\python.exe -c @"
@@ -46,11 +47,8 @@ $commonArgs = @(
     '--icon', 'cove_icon.ico',
     '--paths', 'src',
     '--add-data', ("src\cove_pdf_editor\assets\cove_icon.png" + [IO.Path]::PathSeparator + "cove_pdf_editor\assets"),
-    '--collect-all', 'pdfplumber',
-    '--collect-all', 'pdfminer',
-    '--collect-all', 'reportlab',
     '--collect-binaries', 'pypdfium2_raw',
-    '--collect-binaries', 'pikepdf',
+    '--collect-binaries', 'pymupdf',
     '--exclude-module', 'PySide6.QtWebEngineCore',
     '--exclude-module', 'PySide6.QtWebEngineWidgets',
     '--exclude-module', 'PySide6.QtQml',
@@ -74,7 +72,7 @@ if (Test-Path README.md) { Copy-Item README.md $dirAppDir -Force }
 if (Test-Path LICENSE)   { Copy-Item LICENSE   $dirAppDir -Force }
 
 Step "[4/5] PyInstaller (one-file portable)"
-$portableName = "$App-portable"
+$portableName = "$AppSlug-$Version-Portable"
 & .\.buildenv\Scripts\pyinstaller.exe `
     --noconfirm --clean --log-level WARN `
     --onefile --windowed `
@@ -82,11 +80,8 @@ $portableName = "$App-portable"
     --icon cove_icon.ico `
     --paths src `
     --add-data ("src\cove_pdf_editor\assets\cove_icon.png" + [IO.Path]::PathSeparator + "cove_pdf_editor\assets") `
-    --collect-all pdfplumber `
-    --collect-all pdfminer `
-    --collect-all reportlab `
     --collect-binaries pypdfium2_raw `
-    --collect-binaries pikepdf `
+    --collect-binaries pymupdf `
     --exclude-module PySide6.QtWebEngineCore `
     --exclude-module PySide6.QtWebEngineWidgets `
     --exclude-module PySide6.QtQml `
@@ -132,7 +127,7 @@ $absIcon    = (Resolve-Path cove_icon.ico).Path
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup build failed" }
 
 $portableSrc  = Join-Path 'dist' "$portableName.exe"
-$portableDest = Join-Path $ReleaseDir ("{0}-{1}-Portable.exe" -f $App, $Version)
+$portableDest = Join-Path $ReleaseDir "$portableName.exe"
 if (Test-Path $portableDest) { Remove-Item -Force $portableDest }
 Copy-Item $portableSrc $portableDest -Force
 

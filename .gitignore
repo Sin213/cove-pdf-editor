@@ -6,6 +6,7 @@ venv/
 env/
 
 build/
+docs/old/
 dist/
 release/
 *.spec.bak
@@ -33,12 +34,6 @@ codex-reviews/
 CLAUDE.md
 WORKFLOW.md
 RELEASES.md
-
-# Local archives / generated files
-*.zip
-
-# Local archives / generated files
-*.zip
 
 # Local archives / generated files
 *.zip

@@ -4,14 +4,16 @@ A focused offline PDF editor for **Linux** and **Windows**. Edit
 existing PDF text, add new text, drop images onto pages, save. Never
 touches the cloud.
 
-## Download (v1.0.0)
+![Cove PDF Editor v2.0.0](docs/screenshot.png)
+
+## Download (v2.0.0)
 https://github.com/Sin213/cove-pdf-editor
 | Platform | File |
 | -------- | ---- |
-| Windows (installer) | `cove-pdf-editor-1.0.0-Setup.exe` |
-| Windows (portable) | `cove-pdf-editor-1.0.0-Portable.exe` |
-| Linux (AppImage) | `Cove-PDF-Editor-1.0.0-x86_64.AppImage` |
-| Linux (Debian / Ubuntu) | `cove-pdf-editor_1.0.0_amd64.deb` |
+| Windows (installer) | `Cove-PDF-Editor-2.0.0-Setup.exe` |
+| Windows (portable) | `Cove-PDF-Editor-2.0.0-Portable.exe` |
+| Linux (AppImage) | `Cove-PDF-Editor-2.0.0-x86_64.AppImage` |
+| Linux (Debian / Ubuntu) | `Cove-PDF-Editor-2.0.0-amd64.deb` |
 
 Grab the artifacts from the [Releases page](https://github.com/Sin213/cove-pdf-editor/releases).
 
@@ -93,14 +95,21 @@ PYTHONPATH=src python -m cove_pdf_editor
 
 **Linux:**
 ```bash
-VERSION=1.0.0 ./scripts/build-release.sh
+VERSION=2.0.0 ./scripts/build-release.sh
 ```
 
-**Windows:**
+**Windows (portable only):**
 ```powershell
-.\build.ps1 -Version 1.0.0
+.\scripts\build_windows.ps1 -Version 2.0.0
 ```
-(Requires Python 3.12+ and [Inno Setup 6](https://jrsoftware.org/isdl.php).)
+Output: `release\Cove-PDF-Editor-2.0.0-Portable.exe`.
+Requires Python 3.10+ on Windows.
+
+**Windows (full — installer + portable):**
+```powershell
+.\build.ps1 -Version 2.0.0
+```
+Requires Python 3.10+ and [Inno Setup 6](https://jrsoftware.org/isdl.php).
 
 **GitHub Actions:** tagging `vX.Y.Z` builds all four artifacts and
 attaches them to a release.
