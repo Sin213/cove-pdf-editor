@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import tempfile
+
+import pymupdf
 import pypdfium2 as pdfium
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import (
@@ -26,19 +29,19 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenuBar,
     QMessageBox,
     QPushButton,
     QSizePolicy,
     QSpinBox,
     QStackedWidget,
-    QStatusBar,
     QToolBar,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from . import __version__, updater
+from . import __version__, theme, updater
 from .canvas import PageCanvas
 from .document import Document, FreeText
 from .overlay import export_pages, save
@@ -171,22 +174,6 @@ def _resolve_curated(installed: set[str]) -> list[tuple[str, str]]:
     return out
 
 
-_TOOL_BTN_STYLE = """
-QPushButton {
-    text-align: left;
-    padding: 8px 12px;
-    border: none;
-    border-radius: 4px;
-    color: #cfd0d4;
-    background: transparent;
-    font-size: 12px;
-}
-QPushButton:hover { background: #1b2330; }
-QPushButton:checked { background: #1f3a5c; color: #ffffff; font-weight: 600; }
-QPushButton:disabled { color: #5a616f; }
-"""
-
-
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -194,6 +181,10 @@ class MainWindow(QMainWindow):
         self.resize(1300, 820)
         if ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(ICON_PATH)))
+        # Single source of truth for the app-shell look. Per-widget
+        # setStyleSheet calls are intentionally avoided so this sheet
+        # drives the entire chrome.
+        self.setStyleSheet(theme.GLOBAL_QSS)
         self._doc: Document | None = None
         self._canvas: PageCanvas | None = None
         self._tool_buttons: dict[str, QPushButton] = {}
@@ -213,8 +204,12 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------------- UI
 
     def _build_ui(self) -> None:
-        self._status = QStatusBar()
-        self.setStatusBar(self._status)
+        # Custom status bar lives at the bottom of the central layout
+        # (see _build_status_bar). The QMainWindow's native status bar
+        # slot is unused — we don't call setStatusBar(). The `_status`
+        # attribute exposes a showMessage(text, ms) shim for backward
+        # compatibility with the existing showMessage call sites.
+        self._status = _StatusShim(self)
 
         self._open_act = QAction("Open PDF…", self)
         self._open_act.setShortcut(QKeySequence.Open)
@@ -226,109 +221,470 @@ class MainWindow(QMainWindow):
         self._save_act.setEnabled(False)
         self._save_act.triggered.connect(self._on_save)
 
-        # Formatting toolbar (hidden until a text object is selected).
+        # Formatting toolbar (hidden until a PDF is open). The toolbar is
+        # placed inside the central layout instead of QMainWindow's
+        # toolbar area, because we are reparenting the menu bar inside
+        # the central widget — the toolbar area would otherwise sit
+        # above our in-app title band.
         self._fmt_bar = self._build_format_bar()
-        self.addToolBar(Qt.TopToolBarArea, self._fmt_bar)
         self._fmt_bar.setVisible(False)
         self._selected_edit: FreeText | None = None
 
-        # Main: left sidebar (tools + pages) | canvas
         central = QWidget()
         self.setCentralWidget(central)
-        root = QHBoxLayout(central)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
 
+        # 1. Menu bar.
+        self._menubar = QMenuBar()
+        self._menubar.setNativeMenuBar(False)
+        outer.addWidget(self._menubar)
+
+        # 2. Format toolbar (hidden initially; show on first PDF load).
+        outer.addWidget(self._fmt_bar)
+
+        # 4. Main horizontal split.
+        split = QHBoxLayout()
+        split.setContentsMargins(0, 0, 0, 0)
+        split.setSpacing(0)
+        split.addWidget(self._build_sidebar())
+        split.addWidget(self._build_canvas_wrap(), stretch=1)
+        outer.addLayout(split, stretch=1)
+
+        # 5. Custom status bar.
+        outer.addWidget(self._build_status_bar())
+
+        self._update_tool_enabled(False)
+        self._update_canvas_toolbar_state(False)
+        self._set_pages_count(0)
+        self._update_crumb(None, None)
+        self._set_status_tool("—")
+        self._set_status_page(0, 0)
+
+    # ---- Sidebar ----------------------------------------------------
+
+    def _build_sidebar(self) -> QFrame:
         side = QFrame()
-        side.setFixedWidth(200)
-        side.setStyleSheet("QFrame { background:#14181f; border-right:1px solid #2a2f3a; }")
+        side.setObjectName("Sidebar")
+        side.setFixedWidth(240)
         side_layout = QVBoxLayout(side)
-        side_layout.setContentsMargins(8, 10, 8, 10)
-        side_layout.setSpacing(4)
+        side_layout.setContentsMargins(14, 16, 14, 0)
+        side_layout.setSpacing(18)
 
-        title = QLabel("Tools")
-        title.setStyleSheet("color:#cfd0d4; font-weight:600; padding:6px 8px;")
-        side_layout.addWidget(title)
+        # ---- TOOLS section -----------------------------------------
+        tools_section = QFrame()
+        tools_section.setObjectName("ToolsSection")
+        tools_lay = QVBoxLayout(tools_section)
+        tools_lay.setContentsMargins(0, 0, 0, 0)
+        tools_lay.setSpacing(2)
+        tools_lay.addWidget(self._make_section_row("TOOLS", "5"))
 
         self._tool_group = QButtonGroup(self)
         self._tool_group.setExclusive(True)
+        for icon, name, hot, key, factory, tip in (
+            ("👆", "Select",    "V",  "select",    SelectTool,
+             "Select objects to move, resize, or delete"),
+            ("📝", "Edit Text", "E",  "edit_text", EditTextTool,
+             "Double-click searchable PDF text to replace it"),
+            ("🅰", "Add Text",  "T",  "freetext",  FreeTextTool,
+             "Drag a rectangle to add a new text box"),
+            ("➕", "Text Plus", "⇧T", "text_plus", TextPlusTool,
+             "Click to drop quick text entries — good for filling forms"),
+            ("🖼", "Add Image", "I",  "image",     AddImageTool,
+             "Pick a PNG or JPG and drag a rectangle to place it"),
+        ):
+            tools_lay.addWidget(
+                self._make_tool_row(key, icon, name, hot, factory, tip)
+            )
 
-        def add(label: str, key: str, factory=None, handler=None, tooltip: str = ""):  # noqa: ANN001
-            btn = QPushButton(label)
-            btn.setCheckable(factory is not None)
-            btn.setStyleSheet(_TOOL_BTN_STYLE)
-            btn.setCursor(Qt.PointingHandCursor)
-            if tooltip:
-                btn.setToolTip(tooltip)
-            if factory is not None:
-                self._tool_group.addButton(btn)
-                btn.clicked.connect(lambda: self._select_tool(key, factory))
-            if handler is not None:
-                btn.clicked.connect(handler)
-            self._tool_buttons[key] = btn
-            side_layout.addWidget(btn)
-            return btn
+        side_layout.addWidget(tools_section)
 
-        add("👆  Select",     "select",    SelectTool,
-            tooltip="Select objects to move, resize, or delete")
-        add("📝  Edit Text",  "edit_text", EditTextTool,
-            tooltip="Double-click searchable PDF text to replace it")
-        add("🅰  Add Text",   "freetext",  FreeTextTool,
-            tooltip="Drag a rectangle to add a new text box")
-        add("➕  Text Plus",  "text_plus", TextPlusTool,
-            tooltip="Click to drop quick text entries — good for filling forms")
-        add("🖼  Add Image",  "image",     AddImageTool,
-            tooltip="Pick a PNG or JPG and drag a rectangle to place it")
+        # ---- PAGES section ----------------------------------------
+        pages_section = QFrame()
+        pages_section.setObjectName("PagesSection")
+        pages_lay = QVBoxLayout(pages_section)
+        pages_lay.setContentsMargins(0, 0, 0, 0)
+        pages_lay.setSpacing(6)
 
-        side_layout.addSpacing(12)
-        side_layout.addWidget(_section_header("Pages"))
-        self.page_list = QListWidget()
-        self.page_list.setStyleSheet(
-            "QListWidget { background:#0e1116; color:#cfd0d4; "
-            "border:1px solid #2a2f3a; border-radius:4px; }"
-            "QListWidget::item:selected { background:#1f3a5c; }"
+        self._pages_count_label = QLabel("0")
+        self._pages_count_label.setObjectName("SectionCount")
+        pages_lay.addWidget(
+            self._make_section_row("PAGES", count_widget=self._pages_count_label)
         )
+
+        # Stack: empty card vs. populated page list. Switched in
+        # _set_pages_count().
+        self._pages_stack = QStackedWidget()
+        self._pages_stack.setObjectName("PagesStack")
+        self._pages_empty = self._build_pages_empty()
+        self._pages_stack.addWidget(self._pages_empty)
+        self.page_list = QListWidget()
+        self.page_list.setObjectName("PageList")
         self.page_list.currentRowChanged.connect(self._on_page_changed)
         self.page_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        side_layout.addWidget(self.page_list, stretch=1)
+        self._pages_stack.addWidget(self.page_list)
+        pages_lay.addWidget(self._pages_stack, stretch=1)
 
-        version = QLabel("v1.0.0 · offline")
-        version.setStyleSheet("color:#5a616f; font-size:10px; padding:4px 8px;")
-        side_layout.addWidget(version)
+        side_layout.addWidget(pages_section, stretch=1)
+        return side
 
-        root.addWidget(side)
+    def _make_section_row(
+        self,
+        label: str,
+        count_text: str | None = None,
+        count_widget: QLabel | None = None,
+    ) -> QFrame:
+        row = QFrame()
+        row.setObjectName("SectionRow")
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(4, 0, 4, 4)
+        lay.setSpacing(0)
+        lbl = QLabel(label)
+        lbl.setObjectName("SectionLabel")
+        lay.addWidget(lbl)
+        lay.addStretch(1)
+        if count_widget is not None:
+            lay.addWidget(count_widget)
+        elif count_text is not None:
+            cnt = QLabel(count_text)
+            cnt.setObjectName("SectionCount")
+            lay.addWidget(cnt)
+        return row
 
-        # Canvas container
+    def _make_tool_row(
+        self,
+        key: str,
+        icon: str,
+        name: str,
+        hot: str,
+        factory,  # noqa: ANN001
+        tooltip: str,
+    ) -> QPushButton:
+        btn = QPushButton()
+        btn.setObjectName("ToolButton")
+        btn.setCheckable(True)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setToolTip(tooltip)
+
+        lay = QHBoxLayout(btn)
+        lay.setContentsMargins(10, 0, 10, 0)
+        lay.setSpacing(11)
+
+        ico_lbl = QLabel(icon)
+        ico_lbl.setObjectName("ToolIcon")
+        ico_lbl.setAttribute(Qt.WA_TransparentForMouseEvents)
+        name_lbl = QLabel(name)
+        name_lbl.setObjectName("ToolName")
+        name_lbl.setAttribute(Qt.WA_TransparentForMouseEvents)
+        hot_lbl = QLabel(hot)
+        hot_lbl.setObjectName("HotKey")
+        hot_lbl.setAlignment(Qt.AlignCenter)
+        hot_lbl.setAttribute(Qt.WA_TransparentForMouseEvents)
+
+        lay.addWidget(ico_lbl)
+        lay.addWidget(name_lbl)
+        lay.addStretch(1)
+        lay.addWidget(hot_lbl)
+
+        self._tool_group.addButton(btn)
+        btn.clicked.connect(lambda: self._select_tool(key, factory))
+        # Mirror :checked onto the children's `active` dynamic property
+        # so QSS can flip the icon / name / hotkey badge to the accent
+        # variant. QSS can't traverse parent states from a child label.
+        btn.toggled.connect(lambda on, b=btn: self._sync_tool_row_active(b, on))
+        self._tool_buttons[key] = btn
+        return btn
+
+    def _sync_tool_row_active(self, btn: QPushButton, active: bool) -> None:
+        flag = "true" if active else "false"
+        for child in btn.findChildren(QLabel):
+            if child.objectName() in {"ToolIcon", "ToolName", "HotKey"}:
+                child.setProperty("active", flag)
+                child.style().unpolish(child)
+                child.style().polish(child)
+
+    def _build_pages_empty(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("PagesEmpty")
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(10, 14, 10, 14)
+        lay.setSpacing(2)
+        lay.setAlignment(Qt.AlignCenter)
+        line1 = QLabel("📄")
+        line1.setAlignment(Qt.AlignCenter)
+        line1.setObjectName("PagesEmptyText")
+        line2 = QLabel("No pages yet")
+        line2.setAlignment(Qt.AlignCenter)
+        line2.setObjectName("PagesEmptyText")
+        line3 = QLabel("open a pdf to begin")
+        line3.setAlignment(Qt.AlignCenter)
+        line3.setObjectName("PagesEmptyMono")
+        lay.addWidget(line1)
+        lay.addWidget(line2)
+        lay.addWidget(line3)
+        return card
+
+    def _set_pages_count(self, n: int) -> None:
+        self._pages_count_label.setText(str(n))
+        if n > 0:
+            self._pages_stack.setCurrentWidget(self.page_list)
+        else:
+            self._pages_stack.setCurrentWidget(self._pages_empty)
+
+    # ---- Canvas wrap + toolbar --------------------------------------
+
+    def _build_canvas_wrap(self) -> QFrame:
+        wrap = QFrame()
+        wrap.setObjectName("CanvasWrap")
+        lay = QVBoxLayout(wrap)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        lay.addWidget(self._build_canvas_toolbar())
+
         self._canvas_stack = QStackedWidget()
-        self._canvas_stack.setStyleSheet("QStackedWidget { background:#0a0c11; }")
-        self._placeholder = QLabel(
-            "Drop a PDF here, or press Ctrl+O to open one.\n"
-            "Then pick a tool on the left and click / drag on the page."
-        )
-        self._placeholder.setAlignment(Qt.AlignCenter)
-        self._placeholder.setStyleSheet("color:#7a8294; font-size:14px;")
-        self._canvas_stack.addWidget(self._placeholder)
-        root.addWidget(self._canvas_stack, stretch=1)
+        self._canvas_stack.setObjectName("CanvasStack")
+        self._drop_wrap = self._build_drop_card()
+        self._canvas_stack.addWidget(self._drop_wrap)
+        lay.addWidget(self._canvas_stack, stretch=1)
+        return wrap
 
-        self._update_tool_enabled(False)
+    def _build_canvas_toolbar(self) -> QFrame:
+        bar = QFrame()
+        bar.setObjectName("CanvasToolbar")
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(14, 0, 14, 0)
+        lay.setSpacing(8)
+
+        # Crumb area: doc name / page label.
+        self._crumb_doc = QLabel("Untitled")
+        self._crumb_doc.setObjectName("CrumbActive")
+        crumb_sep = QLabel("/")
+        crumb_sep.setObjectName("CrumbSep")
+        self._crumb_page = QLabel("—")
+        self._crumb_page.setObjectName("Crumb")
+        lay.addWidget(self._crumb_doc)
+        lay.addWidget(crumb_sep)
+        lay.addWidget(self._crumb_page)
+        lay.addStretch(1)
+
+        # Page-nav group: prev / readout / next.
+        nav_group = QFrame()
+        nav_group.setObjectName("ToolbarGroup")
+        nav_lay = QHBoxLayout(nav_group)
+        nav_lay.setContentsMargins(3, 3, 3, 3)
+        nav_lay.setSpacing(2)
+        self._nav_prev = self._make_icon_btn("‹", "Previous page")
+        self._nav_next = self._make_icon_btn("›", "Next page")
+        self._nav_readout = QLabel("0 / 0")
+        self._nav_readout.setObjectName("ZoomReadout")
+        self._nav_readout.setAlignment(Qt.AlignCenter)
+        self._nav_prev.clicked.connect(lambda: self._step_page(-1))
+        self._nav_next.clicked.connect(lambda: self._step_page(+1))
+        nav_lay.addWidget(self._nav_prev)
+        nav_lay.addWidget(self._nav_readout)
+        nav_lay.addWidget(self._nav_next)
+        lay.addWidget(nav_group)
+
+        # Zoom group — placeholder readout, all buttons disabled.
+        zoom_group = QFrame()
+        zoom_group.setObjectName("ToolbarGroup")
+        zoom_lay = QHBoxLayout(zoom_group)
+        zoom_lay.setContentsMargins(3, 3, 3, 3)
+        zoom_lay.setSpacing(2)
+        self._zoom_out = self._make_icon_btn("−", "Zoom out")
+        self._zoom_readout = QLabel("100%")
+        self._zoom_readout.setObjectName("ZoomReadout")
+        self._zoom_readout.setAlignment(Qt.AlignCenter)
+        self._zoom_in = self._make_icon_btn("+", "Zoom in")
+        self._zoom_fit = self._make_icon_btn("⤢", "Fit page")
+        for b in (self._zoom_out, self._zoom_in, self._zoom_fit):
+            b.setEnabled(False)
+        zoom_lay.addWidget(self._zoom_out)
+        zoom_lay.addWidget(self._zoom_readout)
+        zoom_lay.addWidget(self._zoom_in)
+        zoom_lay.addWidget(self._zoom_fit)
+        lay.addWidget(zoom_group)
+
+        # History group — undo / redo (wired to existing handlers).
+        hist_group = QFrame()
+        hist_group.setObjectName("ToolbarGroup")
+        hist_lay = QHBoxLayout(hist_group)
+        hist_lay.setContentsMargins(3, 3, 3, 3)
+        hist_lay.setSpacing(2)
+        self._hist_undo = self._make_icon_btn("↶", "Undo (Ctrl+Z)")
+        self._hist_redo = self._make_icon_btn("↷", "Redo (Ctrl+Y)")
+        self._hist_undo.clicked.connect(self._do_undo)
+        self._hist_redo.clicked.connect(self._do_redo)
+        hist_lay.addWidget(self._hist_undo)
+        hist_lay.addWidget(self._hist_redo)
+        lay.addWidget(hist_group)
+        return bar
+
+    def _make_icon_btn(self, glyph: str, tip: str) -> QToolButton:
+        btn = QToolButton()
+        btn.setObjectName("IconBtn")
+        btn.setText(glyph)
+        btn.setToolTip(tip)
+        btn.setCursor(Qt.PointingHandCursor)
+        return btn
+
+    def _step_page(self, delta: int) -> None:
+        if self._doc is None:
+            return
+        cur = self.page_list.currentRow()
+        if cur < 0:
+            cur = 0
+        target = max(0, min(self._doc.page_count - 1, cur + delta))
+        if target != cur:
+            self.page_list.setCurrentRow(target)
+
+    def _update_canvas_toolbar_state(self, has_doc: bool) -> None:
+        for b in (self._nav_prev, self._nav_next, self._hist_undo, self._hist_redo):
+            b.setEnabled(has_doc)
+        # Zoom buttons stay disabled — placeholders for unimplemented zoom.
+
+    def _update_crumb(self, doc_name: str | None, page_label: str | None) -> None:
+        self._crumb_doc.setText(doc_name if doc_name else "Untitled")
+        self._crumb_page.setText(page_label if page_label else "—")
+
+    # ---- Drop card --------------------------------------------------
+
+    def _build_drop_card(self) -> QFrame:
+        wrap = QFrame()
+        wrap.setObjectName("DropWrap")
+        wrap_lay = QVBoxLayout(wrap)
+        wrap_lay.setContentsMargins(40, 40, 40, 40)
+        wrap_lay.addStretch(1)
+
+        card = QFrame()
+        card.setObjectName("DropCard")
+        card.setMaximumWidth(560)
+        card_lay = QVBoxLayout(card)
+        card_lay.setContentsMargins(36, 36, 36, 36)
+        card_lay.setSpacing(14)
+        card_lay.setAlignment(Qt.AlignCenter)
+
+        glyph = QLabel("📄")
+        glyph.setObjectName("DropGlyph")
+        glyph.setAlignment(Qt.AlignCenter)
+
+        title = QLabel("Drop a PDF to begin")
+        title.setObjectName("DropTitle")
+        title.setAlignment(Qt.AlignCenter)
+
+        body = QLabel(
+            "Drag any PDF onto this window — or press Ctrl+O to open one. "
+            "Then pick a tool on the left and click or drag on the page."
+        )
+        body.setObjectName("DropBody")
+        body.setAlignment(Qt.AlignCenter)
+        body.setWordWrap(True)
+        body.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.MinimumExpanding)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(10)
+        actions.setAlignment(Qt.AlignCenter)
+        open_btn = QPushButton("Open PDF")
+        open_btn.setObjectName("PrimaryBtn")
+        open_btn.setCursor(Qt.PointingHandCursor)
+        open_btn.clicked.connect(self._on_open)
+        new_btn = QPushButton("New blank PDF")
+        new_btn.setObjectName("GhostBtn")
+        new_btn.setCursor(Qt.PointingHandCursor)
+        new_btn.clicked.connect(self._on_new)
+        actions.addWidget(open_btn)
+        actions.addWidget(new_btn)
+
+        meta = QLabel(".pdf  •  up to 200 MB  •  processed locally")
+        meta.setObjectName("DropMeta")
+        meta.setAlignment(Qt.AlignCenter)
+
+        card_lay.addWidget(glyph, alignment=Qt.AlignCenter)
+        card_lay.addWidget(title)
+        card_lay.addWidget(body, alignment=Qt.AlignCenter)
+        card_lay.addLayout(actions)
+        card_lay.addWidget(meta)
+
+        h = QHBoxLayout()
+        h.addStretch(1)
+        h.addWidget(card)
+        h.addStretch(1)
+        wrap_lay.addLayout(h)
+        wrap_lay.addStretch(2)
+        return wrap
+
+    # ---- Status bar -------------------------------------------------
+
+    def _build_status_bar(self) -> QFrame:
+        bar = QFrame()
+        bar.setObjectName("StatusBar")
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(14, 0, 14, 0)
+        lay.setSpacing(8)
+
+        self._status_ok = QLabel("● Ready")
+        self._status_ok.setObjectName("StatusOK")
+
+        self._status_tool_label = QLabel("tool:")
+        self._status_tool_label.setObjectName("StatusTool")
+        self._status_tool_name = QLabel("—")
+        self._status_tool_name.setObjectName("StatusToolName")
+
+        self._status_zoom = QLabel("zoom: 100%")
+        self._status_zoom.setObjectName("StatusSeg")
+
+        self._status_message = QLabel("")
+        self._status_message.setObjectName("StatusSeg")
+
+        self._status_objects = QLabel("0 objects")
+        self._status_objects.setObjectName("StatusSeg")
+        self._status_page_label = QLabel("page 0 / 0")
+        self._status_page_label.setObjectName("StatusSeg")
+
+        lay.addWidget(self._status_ok)
+        lay.addWidget(self._make_status_sep())
+        lay.addWidget(self._status_tool_label)
+        lay.addWidget(self._status_tool_name)
+        lay.addWidget(self._make_status_sep())
+        lay.addWidget(self._status_zoom)
+        lay.addWidget(self._make_status_sep())
+        lay.addWidget(self._status_message, stretch=1)
+        lay.addWidget(self._status_objects)
+        lay.addWidget(self._make_status_sep())
+        lay.addWidget(self._status_page_label)
+
+        # Wire the showMessage shim to the message label.
+        self._status.set_target(self._status_message)
+        bar.setMinimumHeight(28)
+        bar.setMaximumHeight(28)
+        return bar
+
+    def _make_status_sep(self) -> QFrame:
+        sep = QFrame()
+        sep.setObjectName("StatusSep")
+        return sep
+
+    def _set_status_tool(self, name: str) -> None:
+        self._status_tool_name.setText(name if name else "—")
+
+    def _set_status_page(self, current: int, total: int) -> None:
+        self._status_page_label.setText(f"page {current} / {total}")
+        self._nav_readout.setText(f"{current} / {total}")
 
     # --------------------------------------------------------- menu
 
     def _build_menu(self) -> None:
-        self.menuBar().setNativeMenuBar(False)
-        self.menuBar().setStyleSheet(
-            "QMenuBar { background:#14181f; color:#cfd0d4; border-bottom:1px solid #2a2f3a; }"
-            "QMenuBar::item:selected { background:#1f3a5c; }"
-            "QMenu { background:#1a1f2b; color:#cfd0d4; border:1px solid #2a2f3a; }"
-            "QMenu::item:selected { background:#1f3a5c; }"
-            "QMenu::item:disabled { color:#5a616f; }"
-            "QMenu::separator { background:#2a2f3a; height:1px; margin:4px 8px; }"
-        )
-        file_menu = self.menuBar().addMenu("&File")
+        # Native macOS menu off so the global QSS in theme.py styles the
+        # menu bar consistently across platforms. The menu bar instance
+        # was created in _build_ui and is reparented inside the central
+        # widget below the in-app title band.
+        file_menu = self._menubar.addMenu("&File")
 
         self._new_act = QAction("&New…", self)
         self._new_act.setShortcut(QKeySequence.New)
-        self._new_act.setEnabled(False)
+        self._new_act.triggered.connect(self._on_new)
         file_menu.addAction(self._new_act)
 
         file_menu.addAction(self._open_act)
@@ -402,6 +758,21 @@ class MainWindow(QMainWindow):
         self._redo_act.triggered.connect(self._do_redo)
         self.addAction(self._redo_act)
 
+        for seq, key, factory in (
+            ("V",       "select",    SelectTool),
+            ("E",       "edit_text", EditTextTool),
+            ("T",       "freetext",  FreeTextTool),
+            ("Shift+T", "text_plus", TextPlusTool),
+            ("I",       "image",     AddImageTool),
+        ):
+            act = QAction(self)
+            act.setShortcut(QKeySequence(seq))
+            act.setShortcutContext(Qt.WindowShortcut)
+            act.triggered.connect(
+                lambda _=False, k=key, f=factory: self._hotkey_tool(k, f)
+            )
+            self.addAction(act)
+
     def _do_undo(self) -> None:
         if self._canvas is not None:
             self._canvas.undo()
@@ -409,6 +780,40 @@ class MainWindow(QMainWindow):
     def _do_redo(self) -> None:
         if self._canvas is not None:
             self._canvas.redo()
+
+    def _hotkey_tool(self, key: str, factory) -> None:  # noqa: ANN001
+        if self._canvas is None or self._canvas.is_inline_editing():
+            return
+        btn = self._tool_buttons.get(key)
+        if btn is not None and btn.isEnabled():
+            btn.setChecked(True)
+            self._select_tool(key, factory)
+
+    def _on_new(self) -> None:
+        if self._doc is not None and self._doc.dirty:
+            reply = QMessageBox.question(
+                self,
+                "Unsaved Changes",
+                "The current document has unsaved changes.",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            if reply == QMessageBox.Cancel:
+                return
+            if reply == QMessageBox.Save:
+                self._on_save()
+                if self._doc is not None and self._doc.dirty:
+                    return
+        self._create_and_load_blank()
+
+    def _create_and_load_blank(self) -> None:
+        tmp_dir = Path(tempfile.mkdtemp(prefix="cove-"))
+        tmp = tmp_dir / "Untitled.pdf"
+        doc = pymupdf.open()
+        doc.new_page(width=612, height=792)
+        doc.save(str(tmp))
+        doc.close()
+        self._load(tmp)
 
     def _on_open(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -442,6 +847,10 @@ class MainWindow(QMainWindow):
             self.page_list.addItem(QListWidgetItem(f"Page {i + 1}"))
         self.page_list.setCurrentRow(0)
         self.page_list.blockSignals(False)
+        self._set_pages_count(n)
+        self._update_canvas_toolbar_state(True)
+        self._update_crumb(path.name, "page 1")
+        self._set_status_page(1, n)
         self._status.showMessage(f"{path.name} • {n} page(s)", 6000)
         self._update_tool_enabled(True)
         self._save_act.setEnabled(True)
@@ -589,6 +998,9 @@ class MainWindow(QMainWindow):
     def _on_page_changed(self, row: int) -> None:
         if self._canvas is not None and row >= 0:
             self._canvas.set_page(row)
+        if self._doc is not None and row >= 0:
+            self._set_status_page(row + 1, self._doc.page_count)
+            self._update_crumb(self._doc.source.name, f"page {row + 1}")
 
     # --------------------------------------------------------- helpers
 
@@ -602,28 +1014,9 @@ class MainWindow(QMainWindow):
         bar = QToolBar("Formatting")
         bar.setMovable(False)
         bar.setIconSize(bar.iconSize())  # let Qt pick a sensible default
-        # Lighter background than the rest of the chrome so the bar visibly
-        # reads as a separate row, plus stronger disabled vs enabled
-        # contrast so the controls don't fade into the dark theme.
-        bar.setStyleSheet(
-            "QToolBar { background:#1d2330; border-top:1px solid #2a3142; "
-            "border-bottom:1px solid #2a3142; padding:6px 8px; }"
-            "QToolBar QLabel { color:#9aa3b8; padding:0 10px 0 2px; "
-            "font-size:11px; font-weight:700; }"
-            "QToolBar QToolButton { color:#e2e6ee; padding:6px 10px; "
-            "margin:0 1px; border:1px solid transparent; border-radius:3px; "
-            "font-size:13px; min-width:24px; }"
-            "QToolBar QToolButton:hover:!disabled { background:#2a3a55; "
-            "border-color:#3a4a65; }"
-            "QToolBar QToolButton:checked:!disabled { background:#3a5a8c; "
-            "color:#ffffff; border-color:#4a6aa0; }"
-            "QToolBar QToolButton:disabled { color:#5a6275; }"
-            "QToolBar QFontComboBox, QToolBar QSpinBox { background:#0e1116; "
-            "color:#e2e6ee; border:1px solid #2a3142; border-radius:3px; "
-            "padding:3px 4px; min-height:22px; }"
-            "QToolBar QFontComboBox:disabled, QToolBar QSpinBox:disabled "
-            "{ color:#5a6275; background:#161a22; }"
-        )
+        # Visual styling lives in theme.GLOBAL_QSS (QToolBar +
+        # QToolBar QToolButton selectors). No local QSS so the bar
+        # stays in step with the rest of the chrome automatically.
 
         bar.addWidget(QLabel("FORMAT"))
 
@@ -713,6 +1106,7 @@ class MainWindow(QMainWindow):
         when the active tool changes from outside the sidebar — e.g. a
         placement tool calling ``canvas.return_to_select()`` after
         committing an edit."""
+        self._set_status_tool(name)
         btn = self._tool_buttons.get(name)
         if btn is None or btn.isChecked():
             return
@@ -721,6 +1115,7 @@ class MainWindow(QMainWindow):
         btn.blockSignals(True)
         btn.setChecked(True)
         btn.blockSignals(False)
+        self._sync_tool_row_active(btn, True)
 
     def _on_canvas_selection(self, edit) -> None:  # noqa: ANN001
         is_text = isinstance(edit, FreeText)
@@ -782,14 +1177,9 @@ class MainWindow(QMainWindow):
             self._color_btn.setStyleSheet("")  # inherit toolbar QSS
             return
         r, g, b = self._selected_edit.color
-        # Per-button QSS — keeps the toolbar's spacing/border/min-width
+        # Per-button QSS — keeps the toolbar geometry from theme.py
         # while overriding just the foreground color of the 'A'.
-        self._color_btn.setStyleSheet(
-            f"QToolButton {{ color: rgb({r},{g},{b}); padding:6px 10px; "
-            f"margin:0 1px; border:1px solid transparent; border-radius:3px; "
-            f"min-width:24px; }}"
-            f"QToolButton:hover {{ background:#2a3a55; border-color:#3a4a65; }}"
-        )
+        self._color_btn.setStyleSheet(theme.color_swatch_qss(r, g, b))
 
     def _apply_change(self) -> None:
         if self._selected_edit is None or self._canvas is None:
@@ -907,7 +1297,30 @@ class MainWindow(QMainWindow):
                 return
 
 
-def _section_header(text: str) -> QLabel:
-    label = QLabel(text)
-    label.setStyleSheet("color:#7a8294; font-size:10px; font-weight:600; padding:6px 8px 2px 8px;")
-    return label
+class _StatusShim:
+    """Tiny showMessage(text, ms) shim that targets a QLabel so existing
+    QStatusBar-style call sites keep working with the custom status bar."""
+
+    def __init__(self, parent) -> None:  # noqa: ANN001
+        self._target: QLabel | None = None
+        self._timer = QTimer(parent)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._clear)
+
+    def set_target(self, label: QLabel) -> None:
+        self._target = label
+
+    def showMessage(self, text: str, timeout_ms: int = 0) -> None:  # noqa: N802
+        if self._target is None:
+            return
+        self._target.setText(text or "")
+        self._timer.stop()
+        if timeout_ms > 0:
+            self._timer.start(timeout_ms)
+
+    def clearMessage(self) -> None:  # noqa: N802
+        self._clear()
+
+    def _clear(self) -> None:
+        if self._target is not None:
+            self._target.setText("")

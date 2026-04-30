@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QGraphicsView,
 )
 
+from . import theme
 from .document import Document, EditText, FreeText, ImageEdit
 from .render import (
     PageImage,
@@ -157,8 +158,8 @@ class EditObjectItem(QGraphicsObject):
 
     HANDLE_PX = 10
     MIN_PX = 16
-    HANDLE_COLOR = QColor(95, 180, 255)
-    HANDLE_FILL = QColor(255, 255, 255)
+    HANDLE_COLOR = theme.HANDLE_BORDER
+    HANDLE_FILL = theme.HANDLE_FILL
 
     def __init__(self, edit, canvas: "PageCanvas") -> None:  # noqa: ANN001
         super().__init__()
@@ -345,7 +346,7 @@ class FreeTextItem(EditObjectItem):
     """Movable / resizable free-text box; double-click opens inline edit."""
 
     def _paint_body(self, painter: QPainter, rect: QRectF) -> None:
-        pen = QPen(QColor(100, 180, 255))
+        pen = QPen(theme.FREETEXT_BORDER)
         pen.setStyle(Qt.DashLine)
         pen.setWidth(1)
         painter.setPen(pen)
@@ -455,7 +456,9 @@ class PageCanvas(QGraphicsView):
         self.setScene(self._scene)
         self.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
         self.setDragMode(QGraphicsView.NoDrag)
-        self.setStyleSheet("QGraphicsView { background:#1a1d24; border:none; }")
+        self.setStyleSheet(
+            f"QGraphicsView {{ background: {theme.VIEW_BG_HEX}; border: none; }}"
+        )
 
         self._bg_item: QGraphicsPixmapItem | None = None
         self._overlay_group: QGraphicsItemGroup | None = None
@@ -486,6 +489,9 @@ class PageCanvas(QGraphicsView):
         self.setFocusPolicy(Qt.StrongFocus)
         self._scene.selectionChanged.connect(self._emit_selection)
         self._load_page(0)
+
+    def is_inline_editing(self) -> bool:
+        return self._active_editor is not None
 
     def _emit_selection(self) -> None:
         # While the user is inline-editing an existing FreeText, expose
@@ -1002,7 +1008,7 @@ class PageCanvas(QGraphicsView):
         # Darker, slightly thicker dashed border so the editing rect is
         # clearly visible on white pages. UI-only — never drawn into the
         # saved PDF.
-        border_pen = QPen(QColor(60, 130, 220))
+        border_pen = QPen(theme.INLINE_EDIT_BORDER)
         border_pen.setStyle(Qt.DashLine)
         border_pen.setWidthF(1.6)
         border = self._scene.addRect(

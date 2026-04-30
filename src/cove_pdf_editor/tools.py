@@ -11,6 +11,7 @@ from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QBrush, QColor, QPen
 from PySide6.QtWidgets import QFileDialog
 
+from . import theme
 from .canvas import PageCanvas
 from .document import EditText, FreeText, ImageEdit
 
@@ -114,8 +115,8 @@ class _DragRectTool:
 
     # Visible drag preview so the user can see the box while dragging it
     # out — most PDFs are white, so an invisible rect was unusable.
-    _PREVIEW_PEN_COLOR = QColor(60, 130, 220)
-    _PREVIEW_FILL_COLOR = QColor(60, 130, 220, 28)  # very light tint
+    _PREVIEW_PEN_COLOR = theme.DRAG_PREVIEW_PEN
+    _PREVIEW_FILL_COLOR = theme.DRAG_PREVIEW_FILL
 
     def __init__(self) -> None:
         self._start_pdf: tuple[float, float] | None = None
