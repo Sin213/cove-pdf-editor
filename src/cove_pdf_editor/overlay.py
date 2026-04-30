@@ -12,6 +12,8 @@ produces those.
 """
 from __future__ import annotations
 
+import os
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -27,41 +29,93 @@ def save(doc: Document, out: Path) -> Path:
     glyphs are removed from the content stream, not just visually
     covered), apply the redactions, then draw replacement text + any
     ``FreeText`` / ``ImageEdit`` on top.
+
+    Writes always land via a sibling temp file in the destination's
+    directory followed by :func:`os.replace`, so a kill mid-write never
+    leaves a partial file at ``out``. When ``out`` resolves to the same
+    inode as ``doc.source``, the source handle is closed before the
+    rename, which side-steps pymupdf's "save to original must be
+    incremental" rejection and Windows file-locking errors.
     """
-    if not doc.edits:
-        # No work to do; copy bytes verbatim so the saved file is byte-exact.
-        out.write_bytes(doc.source.read_bytes())
-        return out
-    with pymupdf.open(str(doc.source)) as pdf:
-        for page_idx in range(doc.page_count):
-            page = pdf[page_idx]
-            page_edits = doc.edits_for_page(page_idx)
-            redacted = False
-            for edit in page_edits:
-                if isinstance(edit, EditText):
-                    _queue_redaction(page, edit)
-                    redacted = True
-            if redacted:
-                # Remove the underlying text and stamp a white rect; leave
-                # images and vector graphics alone (`images=0`,
-                # `graphics=0`).
-                page.apply_redactions(images=0, graphics=0)
-            # Whiteout the original location of any image promoted from
-            # the source PDF, so the moved/resized/deleted version isn't
-            # ghosted by the baked-in original.
-            for edit in page_edits:
-                if isinstance(edit, ImageEdit) and edit.original_bbox is not None:
-                    rect = _pdf_rect(page, edit.original_bbox)
-                    # Slight outward pad so antialiased edges of the
-                    # baked-in original image don't peek out.
-                    pad = 1.5
-                    rect = pymupdf.Rect(rect.x0 - pad, rect.y0 - pad,
-                                        rect.x1 + pad, rect.y1 + pad)
-                    page.draw_rect(rect, color=(1, 1, 1), fill=(1, 1, 1), width=0)
-            for edit in page_edits:
-                _draw(page, edit)
-        pdf.save(str(out), garbage=4, deflate=True)
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{out.name}.", suffix=".part", dir=str(out.parent),
+    )
+    os.close(tmp_fd)
+    tmp_path = Path(tmp_name)
+    try:
+        if not doc.edits:
+            # No work to do; stream-copy so multi-GB sources don't OOM.
+            with open(doc.source, "rb") as src, open(tmp_path, "wb") as dst:
+                shutil.copyfileobj(src, dst, length=1024 * 1024)
+        else:
+            with pymupdf.open(str(doc.source)) as pdf:
+                for page_idx in range(doc.page_count):
+                    page = pdf[page_idx]
+                    page_edits = doc.edits_for_page(page_idx)
+                    redacted = False
+                    for edit in page_edits:
+                        if isinstance(edit, EditText):
+                            _queue_redaction(page, edit)
+                            redacted = True
+                    if redacted:
+                        # Remove the underlying text and stamp a white rect; leave
+                        # images and vector graphics alone (`images=0`,
+                        # `graphics=0`).
+                        page.apply_redactions(images=0, graphics=0)
+                    # Whiteout the original location of any image promoted from
+                    # the source PDF, so the moved/resized/deleted version isn't
+                    # ghosted by the baked-in original.
+                    for edit in page_edits:
+                        if isinstance(edit, ImageEdit) and edit.original_bbox is not None:
+                            rect = _pdf_rect(page, edit.original_bbox)
+                            # Slight outward pad so antialiased edges of the
+                            # baked-in original image don't peek out.
+                            pad = 1.5
+                            rect = pymupdf.Rect(rect.x0 - pad, rect.y0 - pad,
+                                                rect.x1 + pad, rect.y1 + pad)
+                            page.draw_rect(rect, color=(1, 1, 1), fill=(1, 1, 1), width=0)
+                    for edit in page_edits:
+                        _draw(page, edit)
+                pdf.save(str(tmp_path), garbage=4, deflate=True)
+        # ``mkstemp`` opens the temp file with mode 0600. Without this
+        # adjustment, ``os.replace`` would silently make the destination
+        # owner-only — surprising for shared/readable PDFs and for new
+        # files that the user expects to inherit umask defaults.
+        _align_dest_mode(tmp_path, out)
+        # Atomic publish — pdf is closed (or the source file is closed)
+        # before we replace, so Windows can swing the rename and the
+        # destination is never partially written.
+        os.replace(str(tmp_path), str(out))
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
     return out
+
+
+def _align_dest_mode(tmp_path: Path, out: Path) -> None:
+    """Match the temp file's permissions to what the destination should
+    end up with: preserve an existing destination's mode (so overwriting
+    a 0644 PDF doesn't quietly drop world-read), or apply the current
+    umask to a fresh file (so a new save behaves like ``open(..., 'w')``
+    rather than the 0600 mkstemp default)."""
+    try:
+        if out.exists():
+            os.chmod(tmp_path, os.stat(out).st_mode & 0o7777)
+            return
+        # No destination yet: derive the umask-respecting mode the way
+        # the standard library does for a freshly created regular file.
+        prev = os.umask(0)
+        os.umask(prev)
+        os.chmod(tmp_path, 0o666 & ~prev)
+    except OSError:
+        # chmod is best-effort (e.g. on Windows it only toggles read-
+        # only); don't fail the whole save over a permission tweak.
+        pass
 
 
 def _queue_redaction(page: pymupdf.Page, edit: EditText) -> None:

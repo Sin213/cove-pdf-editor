@@ -25,12 +25,14 @@ Usage from a MainWindow:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import stat
 import subprocess
 import sys
+import threading
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +49,23 @@ class UpdateInfo:
     asset_name: str | None = None
     asset_url: str | None = None
     asset_size: int = 0
+    sha256_url: str | None = None
+
+
+class ChecksumError(RuntimeError):
+    """Raised when the downloaded asset's sha256 does not match its sidecar.
+
+    Surfaced as a typed failure so callers can distinguish a tampered or
+    truncated download from a generic IO error and refuse to swap the
+    running binary.
+    """
+
+
+class CancelledError(RuntimeError):
+    """Raised by the verification helpers when the supplied cancel poll
+    returns True. Distinct from :class:`ChecksumError` so the worker can
+    route it to the cancel path (failed("cancelled")) rather than the
+    "checksum mismatch" UI."""
 
 
 def _parse_version(v: str) -> tuple[int, int, int]:
@@ -93,14 +112,136 @@ def preferred_asset(kind: str, assets: list[dict]) -> dict | None:
         return next((a for a in assets if predicate(a["name"].lower())), None)
 
     if kind == "appimage":
-        return first_match(lambda n: n.endswith(".appimage"))
+        return first_match(
+            lambda n: n.endswith(".appimage") and not n.endswith(".sha256"),
+        )
     if kind == "deb":
-        return first_match(lambda n: n.endswith(".deb"))
+        return first_match(
+            lambda n: n.endswith(".deb") and not n.endswith(".sha256"),
+        )
     if kind == "win-setup":
-        return first_match(lambda n: "setup" in n and n.endswith(".exe"))
+        return first_match(
+            lambda n: "setup" in n and n.endswith(".exe"),
+        )
     if kind == "win-portable":
-        return first_match(lambda n: "portable" in n and n.endswith(".exe"))
+        return first_match(
+            lambda n: "portable" in n and n.endswith(".exe"),
+        )
     return None
+
+
+def matching_sha256_asset(asset_name: str, assets: list[dict]) -> dict | None:
+    """Find the ``<asset_name>.sha256`` sidecar in a release's asset list.
+
+    The release pipeline (``.github/workflows/release.yml``) publishes one
+    sidecar per shipped binary, so a missing sidecar at update time is a
+    release-pipeline regression — surface it as a verification failure
+    rather than silently skipping the check.
+    """
+    target = f"{asset_name}.sha256".lower()
+    return next((a for a in assets if a["name"].lower() == target), None)
+
+
+def _parse_sha256_sidecar(text: str) -> str:
+    """Pull the hex hash out of a ``sha256sum`` / ``Get-FileHash`` sidecar.
+
+    Both Linux ``sha256sum <file>`` and the Windows ``Out-File`` block in
+    release.yml produce ``<hex>  <name>``. Take the first whitespace
+    token of the first non-empty line, lower-cased.
+    """
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        token = line.split()[0]
+        if len(token) == 64 and all(c in "0123456789abcdefABCDEF" for c in token):
+            return token.lower()
+        raise ChecksumError(f"unrecognized sidecar contents: {line!r}")
+    raise ChecksumError("empty sidecar")
+
+
+def _sha256_of_file(
+    path: Path,
+    chunk_size: int = 1024 * 1024,
+    is_cancelled=None,
+) -> str:
+    """Hash ``path`` chunk-wise so a multi-MB AppImage doesn't pin the
+    thread for seconds. ``is_cancelled`` is an optional zero-arg callable
+    polled at each chunk; when it returns True the loop raises
+    :class:`CancelledError` so a cancel click during hashing aborts
+    promptly."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            if is_cancelled is not None and is_cancelled():
+                raise CancelledError("cancelled during hashing")
+            block = f.read(chunk_size)
+            if not block:
+                break
+            h.update(block)
+    return h.hexdigest()
+
+
+def fetch_sha256_sidecar(url: str, repo: str, timeout: float = 20.0) -> str:
+    """GET the sidecar URL and return the parsed sha256 hex digest."""
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": f"{repo.split('/')[-1]}-updater"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        # Sidecar files are tiny (a hex hash + name + newline); cap the
+        # read so a hostile redirect can't dump unbounded bytes.
+        raw = resp.read(4096).decode("ascii", errors="replace")
+    return _parse_sha256_sidecar(raw)
+
+
+def verify_sha256(
+    path: Path,
+    sidecar_url: str,
+    repo: str,
+    is_cancelled=None,
+) -> None:
+    """Verify ``path`` matches the hash advertised by ``sidecar_url``.
+
+    On any failure (network error, malformed sidecar, unreadable file,
+    hash mismatch) the partial download at ``path`` is unlinked and a
+    :class:`ChecksumError` is raised. ``is_cancelled`` is an optional
+    zero-arg callable; when it returns True at any of the three
+    sampling points (before sidecar fetch, after sidecar fetch, during
+    hashing) the partial is unlinked and :class:`CancelledError` is
+    raised so the caller can route it to a cancel-failure path.
+    """
+    def _check_cancel() -> None:
+        if is_cancelled is not None and is_cancelled():
+            path.unlink(missing_ok=True)
+            raise CancelledError("verification cancelled")
+
+    _check_cancel()
+    try:
+        expected = fetch_sha256_sidecar(sidecar_url, repo)
+    except ChecksumError:
+        path.unlink(missing_ok=True)
+        raise
+    except Exception as exc:  # noqa: BLE001
+        path.unlink(missing_ok=True)
+        raise ChecksumError(f"could not fetch sidecar: {exc}") from exc
+    _check_cancel()
+    try:
+        actual = _sha256_of_file(path, is_cancelled=is_cancelled)
+    except CancelledError:
+        path.unlink(missing_ok=True)
+        raise
+    except Exception as exc:  # noqa: BLE001
+        # Wrap so an unreadable / vanished cache file is treated as a
+        # verification failure (keeps the function contract tight: any
+        # failure → ChecksumError, no leftover artifact).
+        path.unlink(missing_ok=True)
+        raise ChecksumError(f"could not hash downloaded file: {exc}") from exc
+    if actual != expected:
+        path.unlink(missing_ok=True)
+        raise ChecksumError(
+            f"sha256 mismatch: expected {expected}, got {actual}",
+        )
 
 
 def fetch_latest_release(repo: str, timeout: float = 8.0) -> dict | None:
@@ -143,6 +284,9 @@ class UpdateCheckWorker(QObject):
             return
         assets = data.get("assets") or []
         asset = preferred_asset(bundle_kind(), assets)
+        sidecar = (
+            matching_sha256_asset(asset["name"], assets) if asset else None
+        )
         info = UpdateInfo(
             latest_version=latest,
             release_url=(
@@ -152,26 +296,39 @@ class UpdateCheckWorker(QObject):
             asset_name=asset["name"] if asset else None,
             asset_url=asset["browser_download_url"] if asset else None,
             asset_size=int(asset["size"]) if asset else 0,
+            sha256_url=sidecar["browser_download_url"] if sidecar else None,
         )
         self.updateAvailable.emit(info)
 
 
 class DownloadWorker(QObject):
-    """Stream a URL to a destination file, emitting progress as a percentage."""
+    """Stream a URL to a destination file, emit progress, then verify
+    against the matching sha256 sidecar — all on the worker thread so
+    the GUI never blocks on the network or on hashing a multi-MB file."""
 
     progress = Signal(int)           # 0–100
-    finished = Signal(str)           # destination path
-    failed = Signal(str)
+    finished = Signal(str)           # destination path (post-verify)
+    failed = Signal(str)             # download / IO error
+    verifyFailed = Signal(str)       # checksum failure (typed)
 
-    def __init__(self, url: str, dest: Path, repo: str) -> None:
+    def __init__(
+        self, url: str, dest: Path, repo: str, sha256_url: str | None,
+    ) -> None:
         super().__init__()
         self._url = url
         self._dest = dest
         self._repo = repo
-        self._cancelled = False
+        self._sha256_url = sha256_url
+        # ``threading.Event`` is safe to set from any thread without
+        # depending on the worker's Qt event loop (``run`` is busy on
+        # the network / hashing and never pumps queued slot calls). The
+        # GUI-thread cancel button connects via ``Qt.DirectConnection``
+        # so ``cancel()`` runs on the GUI thread and writes the flag
+        # synchronously; the worker observes it on its next read.
+        self._cancel = threading.Event()
 
     def cancel(self) -> None:
-        self._cancelled = True
+        self._cancel.set()
 
     def run(self) -> None:
         try:
@@ -185,7 +342,7 @@ class DownloadWorker(QObject):
                 self._dest.parent.mkdir(parents=True, exist_ok=True)
                 with open(self._dest, "wb") as f:
                     while True:
-                        if self._cancelled:
+                        if self._cancel.is_set():
                             raise RuntimeError("cancelled")
                         chunk = resp.read(262144)
                         if not chunk:
@@ -194,13 +351,50 @@ class DownloadWorker(QObject):
                         written += len(chunk)
                         if total > 0:
                             self.progress.emit(int(written * 100 / total))
-            self.finished.emit(str(self._dest))
         except Exception as exc:  # noqa: BLE001
             try:
                 self._dest.unlink(missing_ok=True)
             except Exception:  # noqa: BLE001
                 pass
             self.failed.emit(str(exc))
+            return
+        # Honor cancel before kicking off verification.
+        if self._cancel.is_set():
+            self._discard_partial()
+            self.failed.emit("cancelled")
+            return
+        # Verify on this worker thread so a 20-second sidecar timeout
+        # plus full-file hashing never freezes the UI. ``verify_sha256``
+        # unlinks the partial on any failure and polls ``is_cancelled``
+        # at three points so a cancel click mid-hash aborts promptly.
+        if self._sha256_url is None:
+            self.failed.emit("missing checksum sidecar URL")
+            return
+        try:
+            verify_sha256(
+                self._dest, self._sha256_url, self._repo,
+                is_cancelled=self._cancel.is_set,
+            )
+        except CancelledError:
+            self.failed.emit("cancelled")
+            return
+        except ChecksumError as exc:
+            self.verifyFailed.emit(str(exc))
+            return
+        # Belt-and-suspenders re-check: a cancel that landed in the
+        # narrow window between the last poll and ``finished.emit``
+        # must still abort the install.
+        if self._cancel.is_set():
+            self._discard_partial()
+            self.failed.emit("cancelled")
+            return
+        self.finished.emit(str(self._dest))
+
+    def _discard_partial(self) -> None:
+        try:
+            self._dest.unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def swap_in_appimage(new_path: Path) -> Path:
@@ -254,6 +448,7 @@ class UpdateController(QObject):
         self._download_worker: DownloadWorker | None = None
         self._progress: QProgressDialog | None = None
         self._prompt_shown = False
+        self._pending_info: UpdateInfo | None = None
 
     def check(self) -> None:
         if self._thread is not None:
@@ -318,6 +513,19 @@ class UpdateController(QObject):
         if not info.asset_url or not info.asset_name:
             QDesktopServices.openUrl(QUrl(info.release_url))
             return
+        if not info.sha256_url:
+            # Refuse to swap the running binary without a checksum to
+            # verify against. The release pipeline always publishes a
+            # sidecar for shipped artifacts; a missing one means we
+            # can't establish trust on the downloaded file.
+            QMessageBox.warning(
+                self._parent, "Update unavailable",
+                "Couldn't find a sha256 sidecar for this release; "
+                "skipping the in-place update for safety.",
+            )
+            QDesktopServices.openUrl(QUrl(info.release_url))
+            return
+        self._pending_info = info
         cache = Path(os.path.expanduser(f"~/.cache/{self._cache_subdir}"))
         cache.mkdir(parents=True, exist_ok=True)
         dest = cache / info.asset_name
@@ -332,23 +540,36 @@ class UpdateController(QObject):
         self._progress.setValue(0)
 
         thread = QThread(self)
-        worker = DownloadWorker(info.asset_url, dest, self._repo)
+        worker = DownloadWorker(
+            info.asset_url, dest, self._repo, info.sha256_url,
+        )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
-        self._progress.canceled.connect(worker.cancel)
+        worker.verifyFailed.connect(thread.quit)
+        # DirectConnection: cancel() runs on the GUI thread, so the
+        # threading.Event is set synchronously even though the worker
+        # thread is busy in network / hashing and isn't pumping its
+        # event loop. Without this, a queued connection would park the
+        # cancel slot until run() returns — too late.
+        self._progress.canceled.connect(worker.cancel, Qt.DirectConnection)
         worker.progress.connect(self._progress.setValue, Qt.QueuedConnection)
         worker.finished.connect(self._on_downloaded, Qt.QueuedConnection)
         worker.failed.connect(self._on_download_failed, Qt.QueuedConnection)
+        worker.verifyFailed.connect(self._on_verify_failed, Qt.QueuedConnection)
         thread.finished.connect(self._on_download_thread_done, Qt.QueuedConnection)
         self._download_thread = thread
         self._download_worker = worker
         thread.start()
 
     def _on_downloaded(self, path: str) -> None:
+        # Reached only after DownloadWorker has already verified the
+        # sha256 sidecar on its own thread, so the swap is safe to run
+        # synchronously here.
         if self._progress is not None:
             self._progress.close()
+        self._pending_info = None
         try:
             new_path = swap_in_appimage(Path(path))
         except Exception as exc:  # noqa: BLE001
@@ -365,9 +586,21 @@ class UpdateController(QObject):
     def _on_download_failed(self, msg: str) -> None:
         if self._progress is not None:
             self._progress.close()
+        self._pending_info = None
         QMessageBox.warning(
             self._parent, "Update failed",
             f"The download didn't complete:\n{msg}",
+        )
+
+    def _on_verify_failed(self, msg: str) -> None:
+        if self._progress is not None:
+            self._progress.close()
+        self._pending_info = None
+        QMessageBox.warning(
+            self._parent, "Update failed",
+            f"Downloaded update failed checksum verification:\n{msg}\n\n"
+            "The partial download was discarded and your installed "
+            "binary is unchanged.",
         )
 
     def _on_download_thread_done(self) -> None:

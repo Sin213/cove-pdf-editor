@@ -147,6 +147,16 @@ class EditableTextItem(QGraphicsTextItem):
         else:
             self.cancelled.emit()
 
+    def commit_now(self) -> None:
+        """Fire the commit path synchronously, regardless of focus state.
+
+        Used when the canvas needs to harvest the current text before
+        tearing the editor down — focus-out is unreliable when the
+        widget never had keyboard focus, but the user's typed text is
+        still recoverable via ``toPlainText()``.
+        """
+        self._finalize(commit=True)
+
 
 class EditObjectItem(QGraphicsObject):
     """Selectable / movable / resizable wrapper around an Edit dataclass.
@@ -824,6 +834,48 @@ class PageCanvas(QGraphicsView):
         self._doc.add(edit)
         self._refresh_overlay()
         self.editAdded.emit(edit)
+
+    def commit_active_editor(self) -> None:
+        """Force any in-flight inline editor to finalize.
+
+        Drives the same commit path as Enter / Ctrl+Enter, which fires
+        each editor's ``on_commit`` callback — the place where
+        dataclass fields like ``FreeText.text`` / ``EditText.new_text``
+        are written, and where a fresh placement is appended via
+        ``add_edit``. Call this immediately before a save so the user's
+        typed-but-unsubmitted text is captured into ``Document.edits``
+        rather than dropped. Safe to call when no editor is active.
+        """
+        editor = self._active_editor
+        if editor is None:
+            return
+        editor.commit_now()
+
+    def reset_for_saved_source(self) -> None:
+        """Re-sync the canvas after the document has been saved + rebased.
+
+        Drops any active inline editor, clears the undo / redo stacks
+        (their snapshots describe pre-save pending edits that are now
+        baked into ``self._doc.source`` — replaying them would double-
+        apply), forgets cached promoted-image extractions, and reloads
+        the current page from the saved PDF. Because ``_load_page``
+        rebuilds the overlay from ``self._doc.edits`` (which the caller
+        has cleared on save), all stale ``EditObjectItem``s disappear
+        with the rebuild.
+        """
+        if self._active_editor is not None:
+            try:
+                self._scene.removeItem(self._active_editor)
+            except Exception:  # noqa: BLE001
+                pass
+        self._active_editor = None
+        self._editing_edit = None
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self._promoted_image_paths.clear()
+        idx = self._page_index if 0 <= self._page_index < self._doc.page_count else 0
+        self._load_page(idx)
+        self._emit_selection()
 
     # --- source-PDF promotion --------------------------------------
 

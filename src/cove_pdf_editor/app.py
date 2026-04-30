@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from pathlib import Path
-
+import shutil
 import tempfile
+from pathlib import Path
 
 import pymupdf
 import pypdfium2 as pdfium
@@ -213,6 +213,13 @@ class MainWindow(QMainWindow):
         self._doc: Document | None = None
         self._canvas: PageCanvas | None = None
         self._tool_buttons: dict[str, QPushButton] = {}
+        # Per-session temp dir backing a "New" blank PDF. We own this
+        # path and reap it on next New / on a Save As that rebases the
+        # document off the temp file / on app close. Without this the
+        # /tmp/cove-* dirs accumulate forever and (when /tmp is reaped
+        # externally) the canvas's source-of-truth path disappears
+        # mid-session.
+        self._blank_tmp_dir: Path | None = None
         self._build_ui()
         self._build_menu()
         self._install_global_shortcuts()
@@ -831,33 +838,70 @@ class MainWindow(QMainWindow):
             btn.setChecked(True)
             self._select_tool(key, factory)
 
+    def _confirm_discard_changes(self) -> bool:
+        """Save / Discard / Cancel prompt before replacing the open document.
+
+        Returns ``True`` when it's safe to load a different document
+        (either there were no unsaved changes, the user discarded them,
+        or the user picked Save and the save completed). Returns
+        ``False`` when the user cancelled or the save did not complete —
+        in which case the caller must keep the current document
+        untouched.
+
+        Captures any in-flight inline editor first so typed-but-
+        unsubmitted text counts as unsaved state. Without this, opening
+        a different PDF or drag-dropping one onto the window during an
+        active inline edit would silently throw away whatever the user
+        was typing — ``Document.dirty`` only flips when the editor
+        commits.
+        """
+        if self._canvas is not None:
+            self._canvas.commit_active_editor()
+        if self._doc is None or not self._doc.dirty:
+            return True
+        reply = QMessageBox.question(
+            self,
+            "Unsaved Changes",
+            "The current document has unsaved changes.",
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if reply == QMessageBox.Cancel:
+            return False
+        if reply == QMessageBox.Save:
+            self._on_save()
+            if self._doc is not None and self._doc.dirty:
+                return False
+        return True
+
     def _on_new(self) -> None:
-        if self._doc is not None and self._doc.dirty:
-            reply = QMessageBox.question(
-                self,
-                "Unsaved Changes",
-                "The current document has unsaved changes.",
-                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
-                QMessageBox.Cancel,
-            )
-            if reply == QMessageBox.Cancel:
-                return
-            if reply == QMessageBox.Save:
-                self._on_save()
-                if self._doc is not None and self._doc.dirty:
-                    return
+        if not self._confirm_discard_changes():
+            return
         self._create_and_load_blank()
 
     def _create_and_load_blank(self) -> None:
+        # Reap the previous blank temp dir before allocating a new one
+        # so File → New repeatedly doesn't leave a trail in /tmp.
+        self._discard_blank_tmp_dir()
         tmp_dir = Path(tempfile.mkdtemp(prefix="cove-"))
         tmp = tmp_dir / "Untitled.pdf"
         doc = pymupdf.open()
         doc.new_page(width=612, height=792)
         doc.save(str(tmp))
         doc.close()
+        self._blank_tmp_dir = tmp_dir
         self._load(tmp)
 
+    def _discard_blank_tmp_dir(self) -> None:
+        """Remove the per-session blank-PDF tempdir if we own one."""
+        if self._blank_tmp_dir is None:
+            return
+        shutil.rmtree(self._blank_tmp_dir, ignore_errors=True)
+        self._blank_tmp_dir = None
+
     def _on_open(self) -> None:
+        if not self._confirm_discard_changes():
+            return
         path, _ = QFileDialog.getOpenFileName(
             self, "Open PDF", "", "PDF files (*.pdf);;All files (*)",
         )
@@ -912,19 +956,58 @@ class MainWindow(QMainWindow):
     def _on_save(self) -> None:
         if self._doc is None:
             return
+        # Capture any in-flight inline edit before serializing — without
+        # this, Ctrl+S during typing would drop the typed text on the
+        # floor (the EditableTextItem hadn't yet emitted ``committed``,
+        # so the dataclass field powering ``Document.edits`` would still
+        # carry the pre-edit value, and the subsequent
+        # ``reset_for_saved_source`` would tear the editor down).
+        if self._canvas is not None:
+            self._canvas.commit_active_editor()
         default = str(self._doc.source.with_name(self._doc.source.stem + "-edited.pdf"))
         path, _ = QFileDialog.getSaveFileName(
             self, "Save PDF", default, "PDF (*.pdf);;All files (*)",
         )
         if not path:
             return
+        saved_path = Path(path)
         try:
-            save(self._doc, Path(path))
+            save(self._doc, saved_path)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Save failed", str(exc))
             return
+        # Rebase the in-memory document onto the saved file. Without
+        # this the canvas keeps reading from the original input — which
+        # for a "New" doc is a temp file under /tmp that systemd-tmpfiles
+        # may reap — and a second Save would re-bake every prior edit on
+        # top of the already-baked output.
+        prior_source = self._doc.source
+        self._doc.source = saved_path
+        self._doc.edits = []
         self._doc.dirty = False
-        self._status.showMessage(f"Saved {Path(path).name}", 8000)
+        # The canvas still holds EditObjectItems and undo / redo
+        # snapshots that reference the just-cleared edits. Reset it so
+        # the displayed scene matches the now-empty model and a stray
+        # Ctrl+Z can't replay edits already baked into ``saved_path``.
+        if self._canvas is not None:
+            self._canvas.reset_for_saved_source()
+        # If the prior source was inside our blank-PDF tempdir, that
+        # dir is now stale and should be reaped — UNLESS the user
+        # accepted the default Save path, which lives inside the same
+        # tempdir. Deleting the dir in that case would take the just-
+        # saved PDF with it. When the user has parked a real file
+        # inside the tempdir we release ownership instead, so neither
+        # the next File → New nor closeEvent destroys their save.
+        if self._blank_tmp_dir is not None:
+            if self._blank_tmp_dir in saved_path.parents:
+                self._blank_tmp_dir = None
+            elif (
+                prior_source != saved_path
+                and self._blank_tmp_dir in prior_source.parents
+            ):
+                self._discard_blank_tmp_dir()
+        self._update_crumb(saved_path.name, self._crumb_page.text())
+        self._status.showMessage(f"Saved {saved_path.name}", 8000)
 
     # ------------------------------------------------------- export ops
 
@@ -1334,6 +1417,9 @@ class MainWindow(QMainWindow):
         for url in event.mimeData().urls():
             p = url.toLocalFile()
             if p and Path(p).suffix.lower() == ".pdf":
+                if not self._confirm_discard_changes():
+                    event.ignore()
+                    return
                 self._load(Path(p))
                 event.acceptProposedAction()
                 return
@@ -1361,6 +1447,12 @@ class MainWindow(QMainWindow):
     def leaveEvent(self, event) -> None:  # noqa: ANN001
         self._frameless_resizer.clear_hover()
         super().leaveEvent(event)
+
+    def closeEvent(self, event) -> None:  # noqa: ANN001
+        # Reap the per-session blank-PDF tempdir on app exit so we
+        # don't leave /tmp/cove-* directories behind.
+        self._discard_blank_tmp_dir()
+        super().closeEvent(event)
 
 
 class _StatusShim:

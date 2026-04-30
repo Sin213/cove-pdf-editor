@@ -93,26 +93,44 @@ PYTHONPATH=src python -m cove_pdf_editor
 
 ## Building release artifacts
 
-**Linux:**
+**Linux (AppImage + .deb):**
 ```bash
-VERSION=2.0.0 ./scripts/build-release.sh
+VERSION=2.0.1 ./scripts/build-release.sh
 ```
+Outputs `release/Cove-PDF-Editor-<version>-x86_64.AppImage` and
+`release/Cove-PDF-Editor-<version>-amd64.deb`. Requires `python`,
+`curl`, `tar`, `xz`, `binutils` (`ar`), and `libfuse2` (for
+appimagetool). The script downloads `appimagetool` to `~/.local/bin`
+on first run.
 
-**Windows (portable only):**
+**Windows (portable only) — local:**
 ```powershell
-.\scripts\build_windows.ps1 -Version 2.0.0
+.\scripts\build_windows.ps1 -Version 2.0.1
 ```
-Output: `release\Cove-PDF-Editor-2.0.0-Portable.exe`.
+Output: `release\Cove-PDF-Editor-2.0.1-Portable.exe`.
 Requires Python 3.10+ on Windows.
 
-**Windows (full — installer + portable):**
+**Windows (full — installer + portable) — local:**
 ```powershell
-.\build.ps1 -Version 2.0.0
+.\build.ps1 -Version 2.0.1
 ```
-Requires Python 3.10+ and [Inno Setup 6](https://jrsoftware.org/isdl.php).
+Outputs `release\Cove-PDF-Editor-2.0.1-Setup.exe` and
+`release\Cove-PDF-Editor-2.0.1-Portable.exe`. Requires Python 3.10+
+and [Inno Setup 6](https://jrsoftware.org/isdl.php).
 
-**GitHub Actions:** tagging `vX.Y.Z` builds all four artifacts and
-attaches them to a release.
+**GitHub Actions (all four artifacts):** the `release` workflow
+(`.github/workflows/release.yml`) runs `scripts/build-release.sh` on
+`ubuntu-latest` and `build.ps1` on `windows-latest`, and emits matching
+`.sha256` sidecars for every artifact.
+
+- Push a `vX.Y.Z` tag → builds all four artifacts and attaches them
+  (plus checksums) to a GitHub Release.
+- Or run **Actions → release → Run workflow** and pass a `version`
+  input → builds all four artifacts as workflow artifacts (no Release
+  is created).
+
+Every shipped binary has a sibling `<artifact>.sha256` produced with
+standard `sha256sum` output format.
 
 ## Known limits
 
