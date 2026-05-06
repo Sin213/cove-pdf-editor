@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import os
 import shutil
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 import pymupdf
 import pypdfium2 as pdfium
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QRect, Qt, QSettings, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -15,6 +17,7 @@ from PySide6.QtGui import (
     QFont,
     QFontDatabase,
     QIcon,
+    QImage,
     QKeySequence,
     QMouseEvent,
     QPainter,
@@ -39,6 +42,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QStackedWidget,
+    QTabWidget,
     QToolBar,
     QToolButton,
     QVBoxLayout,
@@ -48,19 +52,202 @@ from PySide6.QtWidgets import (
 from . import __version__, theme, updater
 from .canvas import PageCanvas
 from .chrome import CoveTitleBar, FramelessResizer
-from .document import Document, FreeText
-from .overlay import export_pages, save
+from .document import BubbleEdit, Document, FreeText, RedactionEdit
+from .overlay import append_balloon_key_pages, export_pages, save
+from .render import page_info, render_page
 from .tools import (
     AddImageTool,
+    BubbleTool,
     EditTextTool,
     FreeTextTool,
+    RedactTool,
     SelectTool,
+    SignatureTool,
     TextPlusTool,
 )
 
 
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 ICON_PATH = ASSETS_DIR / "cove_icon.png"
+
+# Supported image formats for the "Insert Images as Pages" picker and the
+# page-list image drop. Mirrors AddImageTool's filter so the two entry
+# points accept the same files.
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp")
+_IMAGE_FILTER = "Images (*.png *.jpg *.jpeg *.gif *.bmp);;All files (*)"
+# Default page size for imported images that are smaller than Letter at
+# 72 dpi — image is centered onto the page with aspect preserved.
+_DEFAULT_PAGE_PT = (612.0, 792.0)
+# Cap a single import operation. 50 high-res photos already costs a lot
+# of memory and disk; beyond that we'd rather warn the user.
+_MAX_IMAGE_IMPORT = 50
+
+# Recent-documents store. Persists across launches via QSettings; only
+# absolute file paths are stored (no contents, hashes, or extra metadata).
+_RECENT_KEY = "recentFiles"
+_RECENT_CAP = 8
+# Cap on the number of recents shown directly on the empty drop card —
+# the full list is always available under File → Open Recent.
+_RECENT_CARD_VISIBLE = 5
+
+
+def _rects_intersect(
+    a: tuple[float, float, float, float],
+    b: tuple[float, float, float, float],
+) -> bool:
+    """Axis-aligned rect intersection in PDF points (bottom-left origin
+    or top-left — orientation doesn't matter for AABB overlap)."""
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    return not (ax1 <= bx0 or ax0 >= bx1 or ay1 <= by0 or ay0 >= by1)
+
+
+def _segment_crosses_rect(
+    p1: tuple[float, float],
+    p2: tuple[float, float],
+    rect: tuple[float, float, float, float],
+) -> bool:
+    """Liang-Barsky parametric clip: True iff the closed segment p1-p2
+    has any point inside the AABB ``rect``."""
+    x0, y0, x1, y1 = rect
+    px0, py0 = p1
+    px1, py1 = p2
+    t_min, t_max = 0.0, 1.0
+
+    dx = px1 - px0
+    if dx == 0:
+        if px0 < x0 or px0 > x1:
+            return False
+    else:
+        tx0 = (x0 - px0) / dx
+        tx1 = (x1 - px0) / dx
+        if tx0 > tx1:
+            tx0, tx1 = tx1, tx0
+        t_min = max(t_min, tx0)
+        t_max = min(t_max, tx1)
+        if t_min > t_max:
+            return False
+
+    dy = py1 - py0
+    if dy == 0:
+        if py0 < y0 or py0 > y1:
+            return False
+    else:
+        ty0 = (y0 - py0) / dy
+        ty1 = (y1 - py0) / dy
+        if ty0 > ty1:
+            ty0, ty1 = ty1, ty0
+        t_min = max(t_min, ty0)
+        t_max = min(t_max, ty1)
+        if t_min > t_max:
+            return False
+
+    return True
+
+
+def _bubble_redacted_by(
+    bubble: BubbleEdit,
+    redact_rects: list[tuple[float, float, float, float]],
+) -> bool:
+    """True if any rect overlaps the bubble's marker bbox or its leader
+    segment (circle center → leader anchor). Caller must filter
+    ``redact_rects`` to the bubble's page."""
+    for r in redact_rects:
+        if _rects_intersect(bubble.bbox, r):
+            return True
+    if bubble.leader_anchor is not None:
+        cx = (bubble.bbox[0] + bubble.bbox[2]) / 2
+        cy = (bubble.bbox[1] + bubble.bbox[3]) / 2
+        for r in redact_rects:
+            if _segment_crosses_rect((cx, cy), bubble.leader_anchor, r):
+                return True
+    return False
+
+
+def _fit_centered(
+    target: QRect,
+    src_w: int,
+    src_h: int,
+) -> QRect:
+    """Largest ``target``-aligned rect with the same aspect as
+    ``src_w × src_h``, centered inside ``target``. Used by the physical
+    print path so a landscape page on portrait paper gets letterboxed
+    instead of stretched."""
+    if src_w <= 0 or src_h <= 0 or target.width() <= 0 or target.height() <= 0:
+        return QRect(target)
+    if src_w * target.height() > src_h * target.width():
+        fitted_w = target.width()
+        fitted_h = round(target.width() * src_h / src_w)
+    else:
+        fitted_h = target.height()
+        fitted_w = round(target.height() * src_w / src_h)
+    dx = (target.width() - fitted_w) // 2
+    dy = (target.height() - fitted_h) // 2
+    return QRect(target.x() + dx, target.y() + dy, fitted_w, fitted_h)
+
+
+class _PageList(QListWidget):
+    """Page list that also accepts dropped image files.
+
+    Image URL drops emit ``imagesDropped`` so the main window can append
+    one new PDF page per image. PDF and unsupported drops are ignored
+    here so they fall through to the main window's drag/drop, which is
+    the only path that opens or replaces the active document.
+    """
+
+    imagesDropped = Signal(list)
+
+    def __init__(self, parent=None) -> None:  # noqa: ANN001
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if self._image_paths(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: ANN001
+        if self._image_paths(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        paths = self._image_paths(event)
+        if paths:
+            event.acceptProposedAction()
+            self.imagesDropped.emit(paths)
+        else:
+            event.ignore()
+
+    @staticmethod
+    def _image_paths(event) -> list[Path]:  # noqa: ANN001
+        md = event.mimeData()
+        if not md.hasUrls():
+            return []
+        out: list[Path] = []
+        for url in md.urls():
+            p = url.toLocalFile()
+            if p and Path(p).suffix.lower() in _IMAGE_EXTS:
+                out.append(Path(p))
+        return out
+
+
+@dataclass
+class _Tab:
+    """Per-tab state. Each open document gets one of these. The
+    ``QTabWidget`` index for this tab matches its index in
+    ``MainWindow._tabs``; the canvas widget is what the tab page
+    actually shows. ``blank_tmp_dir`` is owned by this tab when the
+    document was created via File → New (or rebased through Insert
+    Images as Pages…) — the dir is reaped on tab close, on the next
+    rebase, or on app exit."""
+
+    doc: Document
+    canvas: PageCanvas
+    blank_tmp_dir: Path | None = None
+
 
 _CURSOR_SVG_TMPL = (
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
@@ -210,20 +397,22 @@ class MainWindow(QMainWindow):
         # setStyleSheet calls are intentionally avoided so this sheet
         # drives the entire chrome.
         self.setStyleSheet(theme.GLOBAL_QSS)
+        # ``self._doc`` / ``self._canvas`` are aliases that follow the
+        # active tab. Reassigned in ``_on_active_tab_changed``; ``None``
+        # when zero tabs are open. Existing call sites that read these
+        # attributes keep working unchanged.
         self._doc: Document | None = None
         self._canvas: PageCanvas | None = None
+        self._tabs: list[_Tab] = []
         self._tool_buttons: dict[str, QPushButton] = {}
-        # Per-session temp dir backing a "New" blank PDF. We own this
-        # path and reap it on next New / on a Save As that rebases the
-        # document off the temp file / on app close. Without this the
-        # /tmp/cove-* dirs accumulate forever and (when /tmp is reaped
-        # externally) the canvas's source-of-truth path disappears
-        # mid-session.
-        self._blank_tmp_dir: Path | None = None
         self._build_ui()
         self._build_menu()
         self._install_global_shortcuts()
         self.setAcceptDrops(True)
+        # Recent-files surface on the empty drop card. Built after the UI
+        # so the section widgets exist; built before any window operations
+        # so first paint shows the populated state on subsequent launches.
+        self._refresh_drop_card_recents()
         self._updater = updater.UpdateController(
             parent=self,
             current_version=__version__,
@@ -334,6 +523,12 @@ class MainWindow(QMainWindow):
              "Click to drop quick text entries — good for filling forms"),
             ("🖼", "Add Image", "I",  "image",     AddImageTool,
              "Pick a PNG or JPG and drag a rectangle to place it"),
+            ("✍", "Signature", "S",  "signature", SignatureTool,
+             "Place your saved signature; hold Shift to pick a different image"),
+            ("①", "Balloon",  "B",  "bubble",    BubbleTool,
+             "Drag from a feature to drop a numbered balloon (just-click for no leader)"),
+            ("⬛", "Redact",   "R",  "redact",    RedactTool,
+             "Drag a rectangle to permanently remove its content on save"),
         ):
             tools_lay.addWidget(
                 self._make_tool_row(key, icon, name, hot, factory, tip)
@@ -360,9 +555,10 @@ class MainWindow(QMainWindow):
         self._pages_stack.setObjectName("PagesStack")
         self._pages_empty = self._build_pages_empty()
         self._pages_stack.addWidget(self._pages_empty)
-        self.page_list = QListWidget()
+        self.page_list = _PageList()
         self.page_list.setObjectName("PageList")
         self.page_list.currentRowChanged.connect(self._on_page_changed)
+        self.page_list.imagesDropped.connect(self._insert_image_paths_as_pages)
         self.page_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._pages_stack.addWidget(self.page_list)
         pages_lay.addWidget(self._pages_stack, stretch=1)
@@ -492,12 +688,31 @@ class MainWindow(QMainWindow):
 
         lay.addWidget(self._build_canvas_toolbar())
 
+        # Two states: the empty "drop a PDF" card (no tabs open) and the
+        # multi-document QTabWidget (one tab per open document). Switched
+        # in ``_sync_canvas_stack``.
         self._canvas_stack = QStackedWidget()
         self._canvas_stack.setObjectName("CanvasStack")
         self._drop_wrap = self._build_drop_card()
         self._canvas_stack.addWidget(self._drop_wrap)
+        self._tab_widget = QTabWidget()
+        self._tab_widget.setObjectName("DocTabs")
+        self._tab_widget.setTabsClosable(True)
+        self._tab_widget.setMovable(False)
+        self._tab_widget.setDocumentMode(True)
+        self._tab_widget.tabCloseRequested.connect(self._on_tab_close_requested)
+        self._tab_widget.currentChanged.connect(self._on_active_tab_changed)
+        self._canvas_stack.addWidget(self._tab_widget)
         lay.addWidget(self._canvas_stack, stretch=1)
         return wrap
+
+    def _sync_canvas_stack(self) -> None:
+        """Show the drop card when no tabs are open; otherwise the tab
+        widget. Called whenever a tab is added or removed."""
+        if self._tabs:
+            self._canvas_stack.setCurrentWidget(self._tab_widget)
+        else:
+            self._canvas_stack.setCurrentWidget(self._drop_wrap)
 
     def _build_canvas_toolbar(self) -> QFrame:
         bar = QFrame()
@@ -650,10 +865,28 @@ class MainWindow(QMainWindow):
         meta.setObjectName("DropMeta")
         meta.setAlignment(Qt.AlignCenter)
 
+        # Optional Recent section. Hidden when there are no recent files
+        # so the original card layout is preserved on first launch.
+        self._recent_card_section = QFrame()
+        self._recent_card_section.setObjectName("DropRecent")
+        rc_lay = QVBoxLayout(self._recent_card_section)
+        rc_lay.setContentsMargins(0, 6, 0, 0)
+        rc_lay.setSpacing(4)
+        rc_label = QLabel("Recent")
+        rc_label.setObjectName("DropRecentLabel")
+        rc_label.setAlignment(Qt.AlignCenter)
+        rc_lay.addWidget(rc_label)
+        self._recent_btn_layout = QVBoxLayout()
+        self._recent_btn_layout.setContentsMargins(0, 0, 0, 0)
+        self._recent_btn_layout.setSpacing(2)
+        rc_lay.addLayout(self._recent_btn_layout)
+        self._recent_card_section.setVisible(False)
+
         card_lay.addWidget(glyph, alignment=Qt.AlignCenter)
         card_lay.addWidget(title)
         card_lay.addWidget(body, alignment=Qt.AlignCenter)
         card_lay.addLayout(actions)
+        card_lay.addWidget(self._recent_card_section)
         card_lay.addWidget(meta)
 
         h = QHBoxLayout()
@@ -738,6 +971,26 @@ class MainWindow(QMainWindow):
 
         file_menu.addAction(self._open_act)
 
+        self._recent_menu = file_menu.addMenu("Open &Recent")
+        # Repopulate just before the user sees it so we always reflect
+        # the current QSettings state — not whatever was on disk at
+        # construction time.
+        self._recent_menu.aboutToShow.connect(self._refresh_recent_menu)
+        self._refresh_recent_menu()
+
+        self._insert_images_act = QAction("Insert Images as Pages…", self)
+        self._insert_images_act.setEnabled(False)
+        self._insert_images_act.triggered.connect(self._on_insert_images_as_pages)
+        file_menu.addAction(self._insert_images_act)
+
+        self._balloon_key_act = QAction("Append Balloon &Key Page", self)
+        self._balloon_key_act.setEnabled(False)
+        self._balloon_key_act.setToolTip(
+            "Add a page summarizing every numbered balloon and its description",
+        )
+        self._balloon_key_act.triggered.connect(self._on_append_balloon_key)
+        file_menu.addAction(self._balloon_key_act)
+
         file_menu.addSeparator()
 
         self._save_menu_act = QAction("&Save", self)
@@ -757,6 +1010,14 @@ class MainWindow(QMainWindow):
         self._export_selected_act.setEnabled(False)
         self._export_selected_act.triggered.connect(self._on_export_selected)
         export_menu.addAction(self._export_selected_act)
+
+        file_menu.addSeparator()
+
+        self._print_act = QAction("&Print…", self)
+        self._print_act.setShortcut(QKeySequence.Print)
+        self._print_act.setEnabled(False)
+        self._print_act.triggered.connect(self._on_print)
+        file_menu.addAction(self._print_act)
 
         file_menu.addSeparator()
 
@@ -813,6 +1074,9 @@ class MainWindow(QMainWindow):
             ("T",       "freetext",  FreeTextTool),
             ("Shift+T", "text_plus", TextPlusTool),
             ("I",       "image",     AddImageTool),
+            ("S",       "signature", SignatureTool),
+            ("B",       "bubble",    BubbleTool),
+            ("R",       "redact",    RedactTool),
         ):
             act = QAction(self)
             act.setShortcut(QKeySequence(seq))
@@ -838,15 +1102,10 @@ class MainWindow(QMainWindow):
             btn.setChecked(True)
             self._select_tool(key, factory)
 
-    def _confirm_discard_changes(self) -> bool:
-        """Save / Discard / Cancel prompt before replacing the open document.
-
-        Returns ``True`` when it's safe to load a different document
-        (either there were no unsaved changes, the user discarded them,
-        or the user picked Save and the save completed). Returns
-        ``False`` when the user cancelled or the save did not complete —
-        in which case the caller must keep the current document
-        untouched.
+    def _confirm_discard_changes(self, tab: _Tab | None = None) -> bool:
+        """Save / Discard / Cancel prompt before discarding a tab's
+        unsaved edits. ``tab`` defaults to the active tab — pass an
+        explicit one when handling tab-close on a non-active tab.
 
         Captures any in-flight inline editor first so typed-but-
         unsubmitted text counts as unsaved state. Without this, opening
@@ -855,116 +1114,367 @@ class MainWindow(QMainWindow):
         was typing — ``Document.dirty`` only flips when the editor
         commits.
         """
-        if self._canvas is not None:
-            self._canvas.commit_active_editor()
-        if self._doc is None or not self._doc.dirty:
+        target = tab if tab is not None else self._active_tab()
+        if target is None:
             return True
+        target.canvas.commit_active_editor()
+        if not target.doc.dirty:
+            return True
+        # Surface the prompt with the affected tab's filename so users
+        # closing one of several open tabs know which doc this is about.
         reply = QMessageBox.question(
             self,
             "Unsaved Changes",
-            "The current document has unsaved changes.",
+            f"{target.doc.source.name} has unsaved changes.",
             QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
             QMessageBox.Cancel,
         )
         if reply == QMessageBox.Cancel:
             return False
         if reply == QMessageBox.Save:
-            self._on_save()
-            if self._doc is not None and self._doc.dirty:
+            self._save_tab(target)
+            if target.doc.dirty:
                 return False
         return True
 
     def _on_new(self) -> None:
-        if not self._confirm_discard_changes():
-            return
+        # Always opens in a fresh tab — never replaces the active one.
         self._create_and_load_blank()
 
     def _create_and_load_blank(self) -> None:
-        # Reap the previous blank temp dir before allocating a new one
-        # so File → New repeatedly doesn't leave a trail in /tmp.
-        self._discard_blank_tmp_dir()
         tmp_dir = Path(tempfile.mkdtemp(prefix="cove-"))
         tmp = tmp_dir / "Untitled.pdf"
         doc = pymupdf.open()
         doc.new_page(width=612, height=792)
         doc.save(str(tmp))
         doc.close()
-        self._blank_tmp_dir = tmp_dir
-        self._load(tmp)
+        self._load(tmp, blank_tmp_dir=tmp_dir)
 
-    def _discard_blank_tmp_dir(self) -> None:
-        """Remove the per-session blank-PDF tempdir if we own one."""
-        if self._blank_tmp_dir is None:
+    def _discard_blank_tmp_dir(self, tab: _Tab) -> None:
+        """Reap the tab-owned blank-PDF tempdir if it has one."""
+        if tab.blank_tmp_dir is None:
             return
-        shutil.rmtree(self._blank_tmp_dir, ignore_errors=True)
-        self._blank_tmp_dir = None
+        shutil.rmtree(tab.blank_tmp_dir, ignore_errors=True)
+        tab.blank_tmp_dir = None
 
     def _on_open(self) -> None:
-        if not self._confirm_discard_changes():
-            return
         path, _ = QFileDialog.getOpenFileName(
             self, "Open PDF", "", "PDF files (*.pdf);;All files (*)",
         )
         if path:
             self._load(Path(path))
 
-    def _load(self, path: Path) -> None:
+    def _load(
+        self,
+        path: Path,
+        blank_tmp_dir: Path | None = None,
+    ) -> None:
+        """Open ``path`` in a new tab. ``blank_tmp_dir`` is the tempdir
+        that owns ``path`` (set by File → New); cleaned up on tab close."""
         try:
             with pdfium.PdfDocument(str(path)) as doc:
                 n = len(doc)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Could not open PDF", str(exc))
             return
-        self._doc = Document(source=path, page_count=n)
-        if self._canvas is not None:
-            self._canvas_stack.removeWidget(self._canvas)
-            self._canvas.deleteLater()
-        self._canvas = PageCanvas(self._doc)
-        self._canvas.selectionChanged.connect(self._on_canvas_selection)
-        self._canvas.statusMessage.connect(
+        document = Document(source=path, page_count=n)
+        canvas = PageCanvas(document)
+        canvas.selectionChanged.connect(self._on_canvas_selection)
+        canvas.statusMessage.connect(
             lambda msg: self._status.showMessage(msg, 5000),
         )
-        self._canvas.toolChanged.connect(self._on_canvas_tool_changed)
-        self._canvas_stack.addWidget(self._canvas)
-        self._canvas_stack.setCurrentWidget(self._canvas)
-        self.page_list.blockSignals(True)
-        self.page_list.clear()
-        for i in range(n):
-            self.page_list.addItem(QListWidgetItem(f"Page {i + 1}"))
-        self.page_list.setCurrentRow(0)
-        self.page_list.blockSignals(False)
-        self._set_pages_count(n)
-        self._update_canvas_toolbar_state(True)
-        self._update_crumb(path.name, "page 1")
-        self._set_status_page(1, n)
-        self._status.showMessage(f"{path.name} • {n} page(s)", 6000)
-        self._update_tool_enabled(True)
-        self._save_act.setEnabled(True)
-        self._export_current_act.setEnabled(True)
-        self._export_selected_act.setEnabled(True)
-        # The formatting toolbar is now part of the standard surface — show
-        # it for the rest of the session and toggle controls based on what
-        # is selected, instead of hiding the whole bar.
-        self._fmt_bar.setVisible(True)
-        self._set_fmt_bar_enabled(False)
+        canvas.toolChanged.connect(self._on_canvas_tool_changed)
+        # Mouse-wheel page navigation in the canvas updates the sidebar
+        # row + crumb + status without re-entering set_page (block
+        # signals so the sidebar's currentRowChanged doesn't bounce
+        # back into the canvas, which already moved).
+        canvas.pageChanged.connect(self._on_canvas_page_changed)
+
+        tab = _Tab(doc=document, canvas=canvas, blank_tmp_dir=blank_tmp_dir)
+        self._tabs.append(tab)
+        # Switching to the new tab fires currentChanged →
+        # _on_active_tab_changed, which reassigns self._doc / self._canvas
+        # and refreshes sidebar / toolbar / title.
+        idx = self._tab_widget.addTab(canvas, self._tab_label(tab))
+        self._tab_widget.setTabToolTip(idx, str(path))
+        self._sync_canvas_stack()
+        self._tab_widget.setCurrentIndex(idx)
+
         # Default to Select mode so the user can click objects right away.
         select_btn = self._tool_buttons.get("select")
         if select_btn is not None:
             select_btn.setChecked(True)
-        self._canvas.set_tool(SelectTool())
+        canvas.set_tool(SelectTool())
+        self._status.showMessage(f"{path.name} • {n} page(s)", 6000)
+        # Don't pollute Recent with /tmp blank-PDF placeholders. Real
+        # opens (and Save As → ``_save_tab``) are the only sources.
+        if blank_tmp_dir is None:
+            self._remember_recent(path)
+
+    def _tab_label(self, tab: _Tab) -> str:
+        """Tab title: filename, plus a leading * when the doc is dirty."""
+        prefix = "● " if tab.doc.dirty else ""
+        return f"{prefix}{tab.doc.source.name}"
+
+    def _refresh_tab_label(self, tab: _Tab) -> None:
+        try:
+            idx = self._tabs.index(tab)
+        except ValueError:
+            return
+        self._tab_widget.setTabText(idx, self._tab_label(tab))
+        self._tab_widget.setTabToolTip(idx, str(tab.doc.source))
+
+    def _active_tab(self) -> _Tab | None:
+        idx = self._tab_widget.currentIndex()
+        if 0 <= idx < len(self._tabs):
+            return self._tabs[idx]
+        return None
+
+    def _on_active_tab_changed(self, idx: int) -> None:
+        """The currentIndex changed — point the window-level handles at
+        the new active tab and refresh sidebar / toolbar / title to
+        match."""
+        if idx < 0 or idx >= len(self._tabs):
+            self._doc = None
+            self._canvas = None
+            self._set_active_state(False)
+            return
+        tab = self._tabs[idx]
+        self._doc = tab.doc
+        self._canvas = tab.canvas
+
+        # Sidebar page list mirrors the active doc's page count and
+        # current page. Block signals so re-populating doesn't re-enter
+        # set_page on the already-correct canvas page.
+        self.page_list.blockSignals(True)
+        self.page_list.clear()
+        for i in range(self._doc.page_count):
+            self.page_list.addItem(QListWidgetItem(f"Page {i + 1}"))
+        cur = self._canvas.page_index()
+        self.page_list.setCurrentRow(cur if 0 <= cur < self._doc.page_count else 0)
+        self.page_list.blockSignals(False)
+        self._set_pages_count(self._doc.page_count)
+
+        self._set_active_state(True)
+        self._update_crumb(self._doc.source.name, f"page {cur + 1}")
+        self._set_status_page(cur + 1, self._doc.page_count)
+
+        # Sync the toolbar's checked tool with the new active canvas's
+        # current tool (canvases preserve their own tool selection).
+        active_tool = getattr(self._canvas, "_tool", None)
+        tool_name = active_tool.name if active_tool is not None else "select"
+        self._on_canvas_tool_changed(tool_name)
+
+        # Re-emit the new canvas's selection so the format bar reflects
+        # whatever (if anything) was selected on this tab.
+        self._canvas._emit_selection()
+
+        self._update_window_title()
+
+    def _set_active_state(self, has_doc: bool) -> None:
+        """Toggle controls that should only be available with at least
+        one open document. Single-tab UX matches today's behavior."""
+        self._update_canvas_toolbar_state(has_doc)
+        self._update_tool_enabled(has_doc)
+        self._save_act.setEnabled(has_doc)
+        self._export_current_act.setEnabled(has_doc)
+        self._export_selected_act.setEnabled(has_doc)
+        self._insert_images_act.setEnabled(has_doc)
+        self._balloon_key_act.setEnabled(has_doc)
+        self._print_act.setEnabled(has_doc)
+        self._fmt_bar.setVisible(has_doc)
+        if not has_doc:
+            self._set_fmt_bar_enabled(False)
+            self.page_list.blockSignals(True)
+            self.page_list.clear()
+            self.page_list.blockSignals(False)
+            self._set_pages_count(0)
+            self._update_crumb(None, None)
+            self._set_status_page(0, 0)
+            self._set_status_tool("—")
+
+    def _update_window_title(self) -> None:
+        tab = self._active_tab()
+        if tab is None:
+            self.setWindowTitle(f"Cove PDF Editor v{__version__}")
+            return
+        marker = " ●" if tab.doc.dirty else ""
+        self.setWindowTitle(
+            f"Cove PDF Editor v{__version__} — {tab.doc.source.name}{marker}",
+        )
+
+    def _on_tab_close_requested(self, idx: int) -> None:
+        if not (0 <= idx < len(self._tabs)):
+            return
+        tab = self._tabs[idx]
+        if not self._confirm_discard_changes(tab):
+            return
+        self._close_tab(tab)
+
+    # ---- recent documents ------------------------------------------
+
+    @staticmethod
+    def _settings() -> QSettings:
+        # Org/app names match what __main__.py installs on the
+        # QApplication, so QSettings() defaults would also work — but
+        # being explicit keeps the store readable independent of init
+        # order.
+        return QSettings("Cove", "PdfEditor")
+
+    def _recent_files(self) -> list[Path]:
+        raw = self._settings().value(_RECENT_KEY, [])
+        if isinstance(raw, str):
+            # Single-value writes round-trip as a bare string on some
+            # Qt platforms.
+            raw = [raw]
+        if not isinstance(raw, (list, tuple)):
+            return []
+        out: list[Path] = []
+        seen: set[str] = set()
+        for s in raw:
+            text = str(s).strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            out.append(Path(text))
+            if len(out) >= _RECENT_CAP:
+                break
+        return out
+
+    def _write_recent(self, items: list[Path]) -> None:
+        # QSettings stores the list as bare strings — never anything
+        # beyond the path. Capped at _RECENT_CAP entries.
+        self._settings().setValue(
+            _RECENT_KEY, [str(p) for p in items[:_RECENT_CAP]],
+        )
+
+    def _remember_recent(self, path: Path) -> None:
+        """Push ``path`` to the top of the MRU. Dedup by string match;
+        cap at _RECENT_CAP."""
+        if path is None:
+            return
+        try:
+            resolved = Path(path).expanduser()
+        except (OSError, RuntimeError):
+            resolved = Path(path)
+        items = [p for p in self._recent_files() if str(p) != str(resolved)]
+        items.insert(0, resolved)
+        self._write_recent(items)
+        self._refresh_recent_menu()
+        self._refresh_drop_card_recents()
+
+    def _forget_recent(self, path: Path) -> None:
+        items = [p for p in self._recent_files() if str(p) != str(path)]
+        self._write_recent(items)
+        self._refresh_recent_menu()
+        self._refresh_drop_card_recents()
+
+    def _open_recent(self, path: Path) -> None:
+        """Click handler for any Recent entry. Missing files are
+        non-fatal: warn in the status bar and drop the entry from the
+        list."""
+        if not path.exists():
+            self._status.showMessage(
+                f"File no longer exists: {path.name}", 6000,
+            )
+            self._forget_recent(path)
+            return
+        self._load(path)
+
+    def _clear_recent(self) -> None:
+        self._settings().remove(_RECENT_KEY)
+        self._refresh_recent_menu()
+        self._refresh_drop_card_recents()
+
+    def _refresh_drop_card_recents(self) -> None:
+        """Render the visible chunk of recent files on the drop card.
+        Hidden when there are no recents — keeps the first-launch view
+        identical to the pre-recent UI."""
+        layout = getattr(self, "_recent_btn_layout", None)
+        section = getattr(self, "_recent_card_section", None)
+        if layout is None or section is None:
+            return
+        # Drop any previously rendered buttons.
+        while layout.count():
+            item = layout.takeAt(0)
+            w = item.widget() if item is not None else None
+            if w is not None:
+                w.deleteLater()
+        files = self._recent_files()[:_RECENT_CARD_VISIBLE]
+        if not files:
+            section.setVisible(False)
+            return
+        section.setVisible(True)
+        for p in files:
+            btn = QPushButton(p.name)
+            btn.setObjectName("RecentBtn")
+            btn.setToolTip(str(p))
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFlat(True)
+            btn.clicked.connect(lambda _=False, path=p: self._open_recent(path))
+            layout.addWidget(btn)
+
+    def _refresh_recent_menu(self) -> None:
+        """Repopulate the File → Open Recent submenu from QSettings."""
+        menu = getattr(self, "_recent_menu", None)
+        if menu is None:
+            return
+        menu.clear()
+        files = self._recent_files()
+        if not files:
+            empty_act = QAction("(no recent files)", self)
+            empty_act.setEnabled(False)
+            menu.addAction(empty_act)
+        else:
+            for p in files:
+                act = QAction(p.name, self)
+                act.setToolTip(str(p))
+                act.triggered.connect(lambda _=False, path=p: self._open_recent(path))
+                menu.addAction(act)
+            menu.addSeparator()
+            clear_act = QAction("Clear Recent", self)
+            clear_act.triggered.connect(self._clear_recent)
+            menu.addAction(clear_act)
+
+    def _close_tab(self, tab: _Tab) -> None:
+        try:
+            idx = self._tabs.index(tab)
+        except ValueError:
+            return
+        # Pop our list FIRST so the currentChanged signal that
+        # ``removeTab`` may emit (when closing the active tab) sees the
+        # post-close list and points _doc / _canvas at the right
+        # neighbor. The QTabWidget index always tracks self._tabs index.
+        self._tabs.pop(idx)
+        self._tab_widget.removeTab(idx)
+        # Reap the tab-owned tempdir (blank-PDF or post-import working
+        # copy). Then drop the canvas widget — Qt removed it from the
+        # tab widget; deleteLater frees its scene + resources.
+        self._discard_blank_tmp_dir(tab)
+        tab.canvas.deleteLater()
+        self._sync_canvas_stack()
+        # ``removeTab`` may not fire currentChanged when the tab being
+        # closed is not the active one — re-trigger the active-tab
+        # handler so any title / sidebar drift is corrected.
+        self._on_active_tab_changed(self._tab_widget.currentIndex())
 
     def _on_save(self) -> None:
-        if self._doc is None:
+        tab = self._active_tab()
+        if tab is None:
             return
+        self._save_tab(tab)
+
+    def _save_tab(self, tab: _Tab) -> None:
         # Capture any in-flight inline edit before serializing — without
         # this, Ctrl+S during typing would drop the typed text on the
         # floor (the EditableTextItem hadn't yet emitted ``committed``,
         # so the dataclass field powering ``Document.edits`` would still
         # carry the pre-edit value, and the subsequent
         # ``reset_for_saved_source`` would tear the editor down).
-        if self._canvas is not None:
-            self._canvas.commit_active_editor()
-        default = str(self._doc.source.with_name(self._doc.source.stem + "-edited.pdf"))
+        tab.canvas.commit_active_editor()
+        default = str(
+            tab.doc.source.with_name(tab.doc.source.stem + "-edited.pdf"),
+        )
         path, _ = QFileDialog.getSaveFileName(
             self, "Save PDF", default, "PDF (*.pdf);;All files (*)",
         )
@@ -972,7 +1482,7 @@ class MainWindow(QMainWindow):
             return
         saved_path = Path(path)
         try:
-            save(self._doc, saved_path)
+            save(tab.doc, saved_path)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Save failed", str(exc))
             return
@@ -981,33 +1491,357 @@ class MainWindow(QMainWindow):
         # for a "New" doc is a temp file under /tmp that systemd-tmpfiles
         # may reap — and a second Save would re-bake every prior edit on
         # top of the already-baked output.
-        prior_source = self._doc.source
-        self._doc.source = saved_path
-        self._doc.edits = []
-        self._doc.dirty = False
+        prior_source = tab.doc.source
+        tab.doc.source = saved_path
+        # Drop visual edits — they're now part of the saved bitmap. But
+        # keep ``BubbleEdit`` entries around because their ``text``
+        # field is in-session metadata for "Append Balloon Key Page"
+        # and is NOT written into the saved PDF. Each surviving bubble
+        # is marked ``baked=True`` so the next save / canvas refresh
+        # doesn't draw its circle again on top of the already-baked
+        # graphic.
+        # Hard redactions just applied during this save also strip any
+        # baked balloon graphic that intersects them (apply_redactions
+        # with images=2, graphics=1). Drop those bubbles from the
+        # preserved metadata so the Balloon Key page doesn't list a
+        # callout that's no longer visible on the page.
+        redacts_by_page: dict[int, list] = {}
+        for e in tab.doc.edits:
+            if isinstance(e, RedactionEdit):
+                redacts_by_page.setdefault(e.page, []).append(e.bbox)
+        preserved: list = []
+        for e in tab.doc.edits:
+            if isinstance(e, BubbleEdit):
+                page_redacts = redacts_by_page.get(e.page, [])
+                if page_redacts and _bubble_redacted_by(e, page_redacts):
+                    continue
+                e.baked = True
+                preserved.append(e)
+        tab.doc.edits = preserved
+        tab.doc.dirty = False
         # The canvas still holds EditObjectItems and undo / redo
         # snapshots that reference the just-cleared edits. Reset it so
         # the displayed scene matches the now-empty model and a stray
         # Ctrl+Z can't replay edits already baked into ``saved_path``.
-        if self._canvas is not None:
-            self._canvas.reset_for_saved_source()
-        # If the prior source was inside our blank-PDF tempdir, that
-        # dir is now stale and should be reaped — UNLESS the user
+        tab.canvas.reset_for_saved_source()
+        # If the prior source was inside this tab's blank-PDF tempdir,
+        # that dir is now stale and should be reaped — UNLESS the user
         # accepted the default Save path, which lives inside the same
         # tempdir. Deleting the dir in that case would take the just-
         # saved PDF with it. When the user has parked a real file
         # inside the tempdir we release ownership instead, so neither
-        # the next File → New nor closeEvent destroys their save.
-        if self._blank_tmp_dir is not None:
-            if self._blank_tmp_dir in saved_path.parents:
-                self._blank_tmp_dir = None
+        # tab close nor app close destroys their save.
+        if tab.blank_tmp_dir is not None:
+            if tab.blank_tmp_dir in saved_path.parents:
+                tab.blank_tmp_dir = None
             elif (
                 prior_source != saved_path
-                and self._blank_tmp_dir in prior_source.parents
+                and tab.blank_tmp_dir in prior_source.parents
             ):
-                self._discard_blank_tmp_dir()
-        self._update_crumb(saved_path.name, self._crumb_page.text())
+                self._discard_blank_tmp_dir(tab)
+        self._refresh_tab_label(tab)
+        if tab is self._active_tab():
+            self._update_crumb(saved_path.name, self._crumb_page.text())
+            self._update_window_title()
         self._status.showMessage(f"Saved {saved_path.name}", 8000)
+        self._remember_recent(saved_path)
+
+    # ---------------------------------------------------------- print
+
+    def _on_print(self) -> None:
+        tab = self._active_tab()
+        if tab is None:
+            return
+        # Bake any pending in-flight inline edit and the in-memory edit
+        # list into a temp PDF so the printout matches what's on screen
+        # — Save isn't required first.
+        tab.canvas.commit_active_editor()
+        tmp_fd, tmp_name = tempfile.mkstemp(prefix="cove-print-", suffix=".pdf")
+        os.close(tmp_fd)
+        tmp = Path(tmp_name)
+        try:
+            save(tab.doc, tmp)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Print failed", str(exc))
+            tmp.unlink(missing_ok=True)
+            return
+
+        # Local imports keep startup cost down for users who never print.
+        from PySide6.QtPrintSupport import QPrintDialog, QPrinter
+        from PySide6.QtWidgets import QDialog
+
+        printer = QPrinter(QPrinter.HighResolution)
+        printer.setDocName(tab.doc.source.stem)
+        dlg = QPrintDialog(printer, self)
+        dlg.setWindowTitle("Print")
+        if dlg.exec() != QDialog.Accepted:
+            tmp.unlink(missing_ok=True)
+            return
+
+        if printer.printRange() == QPrinter.PageRange:
+            first = max(1, printer.fromPage()) - 1
+            last = min(tab.doc.page_count, printer.toPage() or tab.doc.page_count) - 1
+        else:
+            first, last = 0, tab.doc.page_count - 1
+        if first > last:
+            tmp.unlink(missing_ok=True)
+            return
+
+        # "Print to File" with a PDF target: bypass the raster pipeline
+        # and copy the (already vector-clean) temp PDF straight to the
+        # output. Rasterizing here turned 875 KB sources into ~75 MB
+        # printouts because every page got re-encoded as a high-res
+        # bitmap.
+        if printer.outputFormat() == QPrinter.PdfFormat:
+            out_path_str = printer.outputFileName()
+            if out_path_str:
+                out_path = Path(out_path_str)
+                try:
+                    if first == 0 and last == tab.doc.page_count - 1:
+                        shutil.copyfile(str(tmp), str(out_path))
+                    else:
+                        sub = pymupdf.open(str(tmp))
+                        sub.select(list(range(first, last + 1)))
+                        sub.save(str(out_path), garbage=4, deflate=True)
+                        sub.close()
+                    self._status.showMessage(f"Saved {out_path.name}", 8000)
+                except Exception as exc:  # noqa: BLE001
+                    QMessageBox.critical(self, "Print failed", str(exc))
+                finally:
+                    tmp.unlink(missing_ok=True)
+                return
+            # No output filename — fall through to raster path (rare).
+
+        painter = QPainter()
+        if not painter.begin(printer):
+            QMessageBox.critical(self, "Print failed", "Could not begin printing.")
+            tmp.unlink(missing_ok=True)
+            return
+        try:
+            target_rect = printer.pageLayout().paintRectPixels(
+                printer.resolution(),
+            )
+            for i in range(first, last + 1):
+                if i > first:
+                    printer.newPage()
+                info = page_info(tmp, i)
+                # Cap render scale at 4× (~288 dpi at 72 dpi base) so
+                # 1200 dpi printers don't allocate a 600 MB intermediate
+                # bitmap per page. drawImage scales it up to the
+                # printer's pixel rect; visual quality at 288 dpi is
+                # plenty for paper.
+                if info.width > 0:
+                    scale = min(4.0, max(2.0, target_rect.width() / info.width))
+                else:
+                    scale = 2.0
+                image = render_page(tmp, i, scale=scale)
+                # Letterbox the page bitmap inside the printer's paint
+                # rect so a landscape source on portrait paper (or any
+                # mismatched aspect ratio in a mixed-size doc) prints
+                # centered without horizontal/vertical squash.
+                fitted = _fit_centered(target_rect, image.width(), image.height())
+                painter.drawImage(fitted, image)
+        finally:
+            painter.end()
+        tmp.unlink(missing_ok=True)
+        self._status.showMessage(
+            f"Printed {tab.doc.source.name}",
+            6000,
+        )
+
+    # ----------------------------------------------- insert images as pages
+
+    def _on_insert_images_as_pages(self) -> None:
+        if self._doc is None:
+            self._status.showMessage("Open or create a PDF first.", 6000)
+            return
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Insert Images as Pages", "", _IMAGE_FILTER,
+        )
+        if not paths:
+            return
+        self._insert_image_paths_as_pages([Path(p) for p in paths])
+
+    def _insert_image_paths_as_pages(self, paths: list[Path]) -> None:
+        """Append one new PDF page per image to the active document.
+
+        The source PDF on disk is not mutated; we write the modified copy
+        to a freshly-allocated temp dir, point ``Document.source`` at it,
+        and mark the doc dirty so the user must Save (As) to publish.
+        Existing edits are preserved because they reference page indices
+        on the original pages, which are not reordered or replaced.
+        """
+        if self._doc is None or self._canvas is None:
+            return
+        clean = [p for p in paths if p.suffix.lower() in _IMAGE_EXTS]
+        if not clean:
+            self._status.showMessage("No supported images selected.", 6000)
+            return
+        if len(clean) > _MAX_IMAGE_IMPORT:
+            self._status.showMessage(
+                f"Importing first {_MAX_IMAGE_IMPORT} of {len(clean)} images.",
+                8000,
+            )
+            clean = clean[:_MAX_IMAGE_IMPORT]
+
+        # Capture any in-flight inline edit so the user's typed text is
+        # not dropped when we re-render the canvas from the new source.
+        self._canvas.commit_active_editor()
+
+        new_dir = Path(tempfile.mkdtemp(prefix="cove-imp-"))
+        new_path = new_dir / self._doc.source.name
+        appended = 0
+        skipped: list[str] = []
+        try:
+            with pymupdf.open(str(self._doc.source)) as src:
+                for path in clean:
+                    rect_pw_ph = self._image_page_rect(path)
+                    if rect_pw_ph is None:
+                        skipped.append(path.name)
+                        continue
+                    pw, ph, rect = rect_pw_ph
+                    page = src.new_page(width=pw, height=ph)
+                    try:
+                        data = path.read_bytes()
+                        page.insert_image(rect, stream=data, keep_proportion=False)
+                        appended += 1
+                    except Exception:  # noqa: BLE001
+                        skipped.append(path.name)
+                        # Drop the empty page so we don't ship a blank.
+                        src.delete_page(src.page_count - 1)
+                if appended == 0:
+                    raise RuntimeError("no images could be imported")
+                src.save(str(new_path), garbage=4, deflate=True)
+        except Exception as exc:  # noqa: BLE001
+            shutil.rmtree(new_dir, ignore_errors=True)
+            QMessageBox.critical(self, "Could not insert images", str(exc))
+            return
+
+        # Rebase the active tab's source onto the new file. Reap the
+        # tab's prior owned tempdir if any — the tab now owns
+        # ``new_dir`` until the next rebase, tab close, or app exit.
+        tab = self._active_tab()
+        if tab is None:
+            shutil.rmtree(new_dir, ignore_errors=True)
+            return
+        self._discard_blank_tmp_dir(tab)
+        tab.blank_tmp_dir = new_dir
+        old_count = self._doc.page_count
+        self._doc.source = new_path
+        self._doc.page_count = old_count + appended
+        self._doc.dirty = True
+
+        self.page_list.blockSignals(True)
+        for i in range(old_count, self._doc.page_count):
+            self.page_list.addItem(QListWidgetItem(f"Page {i + 1}"))
+        self.page_list.blockSignals(False)
+        self._set_pages_count(self._doc.page_count)
+
+        # Re-render from the new source. ``reset_for_saved_source``
+        # clears undo / redo — the page-count change can't be cleanly
+        # reverted by the snapshot-of-edits machinery, so we draw a
+        # line under it the same way Save does.
+        self._canvas.reset_for_saved_source()
+        self._refresh_tab_label(tab)
+        self._update_window_title()
+
+        msg = f"Inserted {appended} image{'s' if appended != 1 else ''} as pages"
+        if skipped:
+            msg += f" ({len(skipped)} skipped)"
+        self._status.showMessage(msg, 8000)
+
+    # ----------------------------------------------- balloon key page
+
+    def _on_append_balloon_key(self) -> None:
+        """Append a Balloon Key page (or pages) summarizing every
+        numbered balloon's description. Behaves like the image-import
+        rebase: writes the modified copy to a fresh temp dir, points
+        the doc at it, marks dirty so the user must Save (As) to
+        publish.
+        """
+        if self._doc is None or self._canvas is None:
+            return
+        bubbles = [e for e in self._doc.edits if isinstance(e, BubbleEdit)]
+        if not bubbles:
+            self._status.showMessage(
+                "No balloons on this document yet.", 6000,
+            )
+            return
+
+        self._canvas.commit_active_editor()
+        new_dir = Path(tempfile.mkdtemp(prefix="cove-key-"))
+        new_path = new_dir / self._doc.source.name
+        try:
+            with pymupdf.open(str(self._doc.source)) as src:
+                added = append_balloon_key_pages(src, bubbles)
+                src.save(str(new_path), garbage=4, deflate=True)
+        except Exception as exc:  # noqa: BLE001
+            shutil.rmtree(new_dir, ignore_errors=True)
+            QMessageBox.critical(self, "Could not append key page", str(exc))
+            return
+        if added == 0:
+            shutil.rmtree(new_dir, ignore_errors=True)
+            return
+
+        tab = self._active_tab()
+        if tab is None:
+            shutil.rmtree(new_dir, ignore_errors=True)
+            return
+        self._discard_blank_tmp_dir(tab)
+        tab.blank_tmp_dir = new_dir
+        old_count = self._doc.page_count
+        self._doc.source = new_path
+        self._doc.page_count = old_count + added
+        self._doc.dirty = True
+
+        self.page_list.blockSignals(True)
+        for i in range(old_count, self._doc.page_count):
+            self.page_list.addItem(QListWidgetItem(f"Page {i + 1}"))
+        self.page_list.blockSignals(False)
+        self._set_pages_count(self._doc.page_count)
+
+        self._canvas.reset_for_saved_source()
+        self._refresh_tab_label(tab)
+        self._update_window_title()
+        msg = (
+            f"Appended Balloon Key (1 page)"
+            if added == 1
+            else f"Appended Balloon Key ({added} pages)"
+        )
+        self._status.showMessage(msg, 8000)
+
+    @staticmethod
+    def _image_page_rect(
+        path: Path,
+    ) -> tuple[float, float, "pymupdf.Rect"] | None:
+        """Return ``(page_width_pt, page_height_pt, image_rect_on_page)``
+        for one image, or ``None`` if the file is not a readable image.
+
+        Sizing rule (per acceptance criteria): 1 px = 1 pt at 72 dpi. If
+        the image fits within Letter at 72 dpi, center it on a Letter
+        page; otherwise size the page to the image and fill it edge to
+        edge.
+        """
+        img = QImage(str(path))
+        if img.isNull():
+            return None
+        iw, ih = float(img.width()), float(img.height())
+        if iw <= 0 or ih <= 0:
+            return None
+        default_w, default_h = _DEFAULT_PAGE_PT
+        if iw <= default_w and ih <= default_h:
+            # Smaller-than-default image: keep it at 1:1 (1 px = 1 pt at
+            # 72 dpi) and center it on a Letter page.
+            pw, ph = default_w, default_h
+            rw, rh = iw, ih
+        else:
+            # Larger-than-default: size the page to the image at 72 dpi
+            # and fill the page edge to edge with aspect preserved.
+            pw, ph = iw, ih
+            rw, rh = iw, ih
+        x0 = (pw - rw) / 2
+        y0 = (ph - rh) / 2
+        return pw, ph, pymupdf.Rect(x0, y0, x0 + rw, y0 + rh)
 
     # ------------------------------------------------------- export ops
 
@@ -1102,19 +1936,25 @@ class MainWindow(QMainWindow):
         "freetext":  "Drag a rectangle, then type to add a text box.",
         "text_plus": "Click anywhere to drop a small text entry. Click again for the next one.",
         "image":     "Drag a rectangle to place the image.",
+        "signature": "Drag a rectangle to place your signature.",
+        "bubble":    "Drag from a feature to drop a numbered balloon. Just-click drops one with no leader.",
+        "redact":    "Drag a rectangle to redact. On save, content inside the box is permanently removed.",
     }
 
     def _select_tool(self, key: str, factory) -> None:  # noqa: ANN001
         if self._canvas is None:
             return
         tool = factory()
-        # Image tool needs to ask for its image file up-front.
-        if key == "image":
-            if not tool.prime(self._canvas):
-                btn = self._tool_buttons.get(key)
-                if btn is not None:
-                    btn.setChecked(False)
-                return
+        # Tools may ask the user something before they become active
+        # (Add Image / Signature pick the image file). Any tool with a
+        # prime() method gets that path; declining the prompt cancels
+        # tool activation and re-checks whatever was active before.
+        prime = getattr(tool, "prime", None)
+        if prime is not None and not prime(self._canvas):
+            btn = self._tool_buttons.get(key)
+            if btn is not None:
+                btn.setChecked(False)
+            return
         self._canvas.set_tool(tool)
         prompt = self._TOOL_PROMPTS.get(key, "")
         if prompt:
@@ -1126,6 +1966,15 @@ class MainWindow(QMainWindow):
         if self._doc is not None and row >= 0:
             self._set_status_page(row + 1, self._doc.page_count)
             self._update_crumb(self._doc.source.name, f"page {row + 1}")
+
+    def _on_canvas_page_changed(self, idx: int) -> None:
+        if self._doc is None or idx < 0 or idx >= self._doc.page_count:
+            return
+        self.page_list.blockSignals(True)
+        self.page_list.setCurrentRow(idx)
+        self.page_list.blockSignals(False)
+        self._set_status_page(idx + 1, self._doc.page_count)
+        self._update_crumb(self._doc.source.name, f"page {idx + 1}")
 
     # --------------------------------------------------------- helpers
 
@@ -1248,6 +2097,13 @@ class MainWindow(QMainWindow):
         self._set_fmt_bar_enabled(is_text)
         if is_text:
             self._populate_fmt_bar(edit)
+        # Selection-change is the cheapest, most-frequent place to keep
+        # the dirty marker in sync with the doc — selection happens with
+        # essentially every user gesture that could mutate state.
+        tab = self._active_tab()
+        if tab is not None:
+            self._refresh_tab_label(tab)
+        self._update_window_title()
 
     def _set_fmt_bar_enabled(self, on: bool) -> None:
         for w in (
@@ -1412,17 +2268,20 @@ class MainWindow(QMainWindow):
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
+        else:
+            event.ignore()
 
     def dropEvent(self, event: QDropEvent) -> None:
+        # PDF drops on the main window always open in a new tab — they
+        # never replace the active document. Non-PDF drops are ignored
+        # here; image drops onto the page list are handled by _PageList.
         for url in event.mimeData().urls():
             p = url.toLocalFile()
             if p and Path(p).suffix.lower() == ".pdf":
-                if not self._confirm_discard_changes():
-                    event.ignore()
-                    return
                 self._load(Path(p))
                 event.acceptProposedAction()
                 return
+        event.ignore()
 
     # ----------------------------------------------- frameless resize
 
@@ -1449,9 +2308,16 @@ class MainWindow(QMainWindow):
         super().leaveEvent(event)
 
     def closeEvent(self, event) -> None:  # noqa: ANN001
-        # Reap the per-session blank-PDF tempdir on app exit so we
-        # don't leave /tmp/cove-* directories behind.
-        self._discard_blank_tmp_dir()
+        # Confirm each dirty tab in turn so the user can save / discard
+        # / cancel without losing work. Cancel from any tab aborts the
+        # close.
+        for tab in list(self._tabs):
+            if not self._confirm_discard_changes(tab):
+                event.ignore()
+                return
+        # Reap any tab-owned blank-PDF tempdirs on the way out.
+        for tab in self._tabs:
+            self._discard_blank_tmp_dir(tab)
         super().closeEvent(event)
 
 

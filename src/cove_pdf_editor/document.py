@@ -73,7 +73,55 @@ class ImageEdit:
     kind: Literal["image"] = "image"
 
 
-Edit = EditText | FreeText | ImageEdit
+@dataclass
+class BubbleEdit:
+    """Numbered balloon callout (engineering / blueprint style).
+
+    On the canvas: a small circle with a sequential number inside, plus
+    an optional leader line whose tip points at ``leader_anchor`` (the
+    feature being labeled). On save, the circle + number + leader are
+    baked into the page as vector drawings — they are NOT PDF
+    annotations, so other viewers cannot edit them.
+
+    ``text`` is an in-session description shown on hover / click. It is
+    not written to the saved PDF (the saved drawing is hardcoded).
+    A future "key page" feature can collect descriptions into a table.
+    """
+
+    page: int
+    bbox: Rect                               # small bounding square, ~24pt
+    number: int                              # sequence number drawn inside
+    leader_anchor: tuple[float, float] | None = None
+    text: str = ""
+    fontsize: float = 11.0
+    fontname: str = "Helvetica"
+    fill_color: Color = (220, 232, 246)      # light blueprint blue
+    border_color: Color = (40, 90, 150)
+    text_color: Color = (40, 90, 150)
+    # Set after a Save flushes this balloon's circle/number/leader into
+    # the source PDF's content stream. Keeps the dataclass alive (so
+    # ``text`` survives for "Append Balloon Key Page") while preventing
+    # a second save from drawing the graphic again on top of itself.
+    baked: bool = False
+
+    kind: Literal["bubble"] = "bubble"
+
+
+@dataclass
+class RedactionEdit:
+    """Hardens a rectangle on save: text, images, and vector graphics
+    intersecting the rect are removed from the page content stream and
+    the rect is filled black. Not an annotation — recipients cannot
+    recover the underlying content. Verify the saved PDF before
+    publishing."""
+
+    page: int
+    bbox: Rect
+
+    kind: Literal["redaction"] = "redaction"
+
+
+Edit = EditText | FreeText | ImageEdit | BubbleEdit | RedactionEdit
 
 
 @dataclass

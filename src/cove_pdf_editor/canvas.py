@@ -22,8 +22,10 @@ from PySide6.QtGui import (
     QColor,
     QFont,
     QFontMetricsF,
+    QImage,
     QKeySequence,
     QPainter,
+    QPainterPath,
     QPen,
     QPixmap,
 )
@@ -38,7 +40,14 @@ from PySide6.QtWidgets import (
 )
 
 from . import theme
-from .document import Document, EditText, FreeText, ImageEdit
+from .document import (
+    BubbleEdit,
+    Document,
+    EditText,
+    FreeText,
+    ImageEdit,
+    RedactionEdit,
+)
 from .render import (
     PageImage,
     PageSpan,
@@ -428,12 +437,191 @@ class EditTextItem(EditObjectItem):
         super().mouseDoubleClickEvent(event)
 
 
+class BubbleObjectItem(EditObjectItem):
+    """Numbered-balloon callout (engineering-drawing style).
+
+    Renders a circle with the balloon's number inside; if the edit has a
+    ``leader_anchor`` set, also draws a leader line from the circle's
+    edge to the anchor (with a small arrowhead at the anchor). Move
+    repositions the balloon body; the leader anchor is fixed in PDF
+    coords (the feature being labeled doesn't move). Hover / click
+    shows the description text in a tooltip; double-click edits it.
+    """
+
+    def __init__(self, edit, canvas: "PageCanvas") -> None:  # noqa: ANN001
+        super().__init__(edit, canvas)
+        # Baked balloons are already drawn into the source page bitmap;
+        # the overlay item just sits over them as a transparent hitbox
+        # so hover-tooltip and double-click-to-edit-description still
+        # work. Lock them in place — moving the overlay away from the
+        # baked graphic would be confusing and the saved drawing would
+        # not move.
+        if getattr(edit, "baked", False):
+            self.setFlag(QGraphicsItem.ItemIsMovable, False)
+        self.refresh_tooltip()
+
+    def refresh_tooltip(self) -> None:
+        text = (self._edit.text or "").strip()
+        label = f"#{self._edit.number}"
+        self.setToolTip(f"{label} — {text}" if text else label)
+
+    def boundingRect(self) -> QRectF:
+        body = super().boundingRect()
+        leader = self._leader_local()
+        if leader is None:
+            return body
+        h = self.HANDLE_PX
+        anchor_box = QRectF(leader.x() - h, leader.y() - h, 2 * h, 2 * h)
+        return body.united(anchor_box)
+
+    def _handle_rects(self) -> list[QRectF]:
+        # Baked balloons can't be resized — the circle/number/leader is
+        # already in the saved PDF and resizing the overlay would drift
+        # the hitbox away from the baked graphic. Returning an empty
+        # list disables both the visual handles in _paint_selection and
+        # the hit-test in _handle_at, so the resize entry path stays
+        # closed.
+        if getattr(self._edit, "baked", False):
+            return []
+        return super()._handle_rects()
+
+    def _leader_local(self) -> QPointF | None:
+        if self._edit.leader_anchor is None:
+            return None
+        cm = self._canvas.coord_map()
+        ax_pt, ay_pt = self._edit.leader_anchor
+        scene = cm.pdf_to_qt(ax_pt, ay_pt)
+        return QPointF(scene.x() - self.pos().x(), scene.y() - self.pos().y())
+
+    def _paint_body(self, painter: QPainter, rect: QRectF) -> None:
+        edit = self._edit
+        if getattr(edit, "baked", False):
+            # Balloon graphic already lives in the source page bitmap.
+            # Painting again here would put a second circle on top of
+            # the existing one. The transparent hitbox is enough.
+            return
+        cx = rect.center().x()
+        cy = rect.center().y()
+        r = min(rect.width(), rect.height()) / 2
+
+        leader = self._leader_local()
+        if leader is not None:
+            self._paint_leader(painter, QPointF(cx, cy), r, leader)
+
+        painter.setBrush(QBrush(QColor(*edit.fill_color)))
+        pen = QPen(QColor(*edit.border_color))
+        pen.setWidthF(1.4)
+        painter.setPen(pen)
+        painter.drawEllipse(QPointF(cx, cy), r, r)
+
+        painter.setPen(QColor(*edit.text_color))
+        font = _qt_font_from_pdf(edit.fontname, edit.fontsize * RENDER_SCALE)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(rect, Qt.AlignCenter, str(edit.number))
+
+    def _paint_leader(
+        self,
+        painter: QPainter,
+        center: QPointF,
+        r: float,
+        anchor: QPointF,
+    ) -> None:
+        edit = self._edit
+        dx = anchor.x() - center.x()
+        dy = anchor.y() - center.y()
+        dist = (dx * dx + dy * dy) ** 0.5
+        if dist <= r + 1:
+            return
+        ux, uy = dx / dist, dy / dist
+        edge = QPointF(center.x() + ux * r, center.y() + uy * r)
+        pen = QPen(QColor(*edit.border_color))
+        pen.setWidthF(1.2)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawLine(edge, anchor)
+        # Arrowhead at the anchor — small filled triangle, ~7px legs at
+        # 25° off the leader axis.
+        head = 7.0
+        ang = 0.45  # radians, ~25°
+        import math
+        bx = anchor.x() - ux * head
+        by = anchor.y() - uy * head
+        # Perpendicular vector.
+        px = -uy
+        py = ux
+        spread = head * math.tan(ang)
+        p1 = QPointF(bx + px * spread, by + py * spread)
+        p2 = QPointF(bx - px * spread, by - py * spread)
+        head_path = QPainterPath()
+        head_path.moveTo(anchor)
+        head_path.lineTo(p1)
+        head_path.lineTo(p2)
+        head_path.closeSubpath()
+        painter.setBrush(QBrush(QColor(*edit.border_color)))
+        painter.setPen(Qt.NoPen)
+        painter.drawPath(head_path)
+
+    def mousePressEvent(self, event) -> None:  # noqa: ANN001
+        # Click pops the description up next to the balloon for a quick
+        # preview without entering edit mode. Double-click takes over
+        # for full re-edit.
+        if event.button() == Qt.LeftButton:
+            from PySide6.QtGui import QCursor
+            from PySide6.QtWidgets import QToolTip
+            label = f"#{self._edit.number}"
+            text = (self._edit.text or "").strip()
+            QToolTip.showText(QCursor.pos(), f"{label} — {text}" if text else label)
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: ANN001
+        if event.button() == Qt.LeftButton:
+            self._canvas.start_bubble_edit(self._edit)
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+
+class RedactionObjectItem(EditObjectItem):
+    """Solid black overlay marking a region that will be hardened on
+    save. The thin red outline reminds the user this is destructive —
+    the saved PDF replaces the rect with pure black; this red cue is
+    on-canvas only."""
+
+    def __init__(self, edit, canvas: "PageCanvas") -> None:  # noqa: ANN001
+        super().__init__(edit, canvas)
+        self.setToolTip(
+            "Redaction — text, images, and graphics inside this box "
+            "are removed on save.",
+        )
+
+    def _paint_body(self, painter: QPainter, rect: QRectF) -> None:
+        painter.setBrush(QBrush(Qt.black))
+        painter.setPen(Qt.NoPen)
+        painter.drawRect(rect)
+        # Thin red marker so the user can tell a redaction apart from
+        # a black free-form fill at a glance. Not drawn into the saved
+        # PDF — that's solid black with no border.
+        pen = QPen(QColor(220, 60, 60))
+        pen.setWidthF(1.2)
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(pen)
+        painter.drawRect(rect)
+
+
 class ImageObjectItem(EditObjectItem):
     """Movable / resizable image."""
 
     def __init__(self, edit, canvas: "PageCanvas") -> None:  # noqa: ANN001
         super().__init__(edit, canvas)
-        self._pixmap = QPixmap(str(edit.image_path))
+        # Route the load through QImage with an explicit ARGB format so a
+        # transparent PNG never gets coerced into Format_RGB32 (which
+        # paints alpha=0 pixels as opaque black during move / resize /
+        # repaint).
+        img = QImage(str(edit.image_path))
+        if not img.isNull() and img.format() != QImage.Format_ARGB32_Premultiplied:
+            img = img.convertToFormat(QImage.Format_ARGB32_Premultiplied)
+        self._pixmap = QPixmap.fromImage(img) if not img.isNull() else QPixmap()
 
     def _paint_body(self, painter: QPainter, rect: QRectF) -> None:
         if self._pixmap.isNull():
@@ -443,6 +631,7 @@ class ImageObjectItem(EditObjectItem):
             painter.setBrush(Qt.NoBrush)
             painter.drawRect(rect)
             return
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
         painter.drawPixmap(rect, self._pixmap, QRectF(self._pixmap.rect()))
 
 
@@ -592,6 +781,10 @@ class PageCanvas(QGraphicsView):
                     self._whiteout_source_area(edit.original_bbox)
                 if edit.image_path is not None:
                     self._add_object_item(ImageObjectItem(edit, self))
+            elif isinstance(edit, BubbleEdit):
+                self._add_object_item(BubbleObjectItem(edit, self))
+            elif isinstance(edit, RedactionEdit):
+                self._add_object_item(RedactionObjectItem(edit, self))
 
     def _whiteout_source_area(self, bbox_pdf: tuple[float, float, float, float]) -> None:
         rect = self._coord.pdf_rect_to_qt(*bbox_pdf)
@@ -764,30 +957,49 @@ class PageCanvas(QGraphicsView):
         super().keyPressEvent(event)
 
     def _delete_selected(self) -> bool:
-        # Take one snapshot covering the whole batch before any mutation.
-        if not any(it.isSelected() for it in self._object_items):
-            return False
-        self.take_snapshot()
-        removed = False
-        for item in list(self._object_items):
+        # Walk the selection once to split it into "really delete" and
+        # "skip because baked." Baked balloons can't be removed: their
+        # circle/number/leader is permanently in the saved PDF, and
+        # dropping the metadata would orphan the graphic from any
+        # appended Balloon Key page.
+        deletable: list[EditObjectItem] = []
+        skipped_baked = False
+        for item in self._object_items:
             if not item.isSelected():
                 continue
             edit = item.edit()
-            if isinstance(edit, ImageEdit) and edit.original_bbox is not None:
-                # Promoted source image: leave a tombstone in the doc so
-                # the original baked-in pixels still get whiteouted on
-                # save, but stop drawing the moved image.
-                edit.image_path = None
-                edit.bbox = edit.original_bbox
-                self._doc.dirty = True
-                self._scene.removeItem(item)
-                self._object_items.remove(item)
-                self._refresh_overlay()
-            else:
-                self._doc.remove(edit)
-                self._scene.removeItem(item)
-                self._object_items.remove(item)
-            removed = True
+            if isinstance(edit, BubbleEdit) and getattr(edit, "baked", False):
+                skipped_baked = True
+                continue
+            deletable.append(item)
+
+        removed = False
+        if deletable:
+            # One snapshot covers the whole deletable batch.
+            self.take_snapshot()
+            for item in deletable:
+                edit = item.edit()
+                if isinstance(edit, ImageEdit) and edit.original_bbox is not None:
+                    # Promoted source image: leave a tombstone in the doc
+                    # so the original baked-in pixels still get
+                    # whiteouted on save, but stop drawing the moved
+                    # image.
+                    edit.image_path = None
+                    edit.bbox = edit.original_bbox
+                    self._doc.dirty = True
+                    self._scene.removeItem(item)
+                    self._object_items.remove(item)
+                    self._refresh_overlay()
+                else:
+                    self._doc.remove(edit)
+                    self._scene.removeItem(item)
+                    self._object_items.remove(item)
+                removed = True
+
+        if skipped_baked:
+            self.statusMessage.emit(
+                "Baked balloon — already in the saved PDF, cannot be removed here.",
+            )
         return removed
 
     # --- undo (snapshot-based) -------------------------------------
@@ -1158,6 +1370,28 @@ class PageCanvas(QGraphicsView):
             on_commit=commit,
         )
 
+    def start_bubble_edit(self, edit) -> None:  # noqa: ANN001
+        """Edit a sticky-note's text in a popup dialog.
+
+        Inline editing doesn't fit a small marker icon, so we use a
+        modeless prompt instead. Cancelling leaves the existing text
+        untouched.
+        """
+        from PySide6.QtWidgets import QInputDialog
+        text, ok = QInputDialog.getMultiLineText(
+            self, "Note", "Note text:", edit.text,
+        )
+        if not ok or text == edit.text:
+            return
+        self.take_snapshot()
+        edit.text = text
+        self._doc.dirty = True
+        for item in self._object_items:
+            if item.edit() is edit and isinstance(item, BubbleObjectItem):
+                item.refresh_tooltip()
+                item.update()
+                break
+
     def start_edittext_reedit(self, edit) -> None:  # noqa: ANN001
         """Re-edit an existing EditText replacement (after double-click).
         Opens at the *current* bbox (which may have been moved); the
@@ -1203,6 +1437,24 @@ class PageCanvas(QGraphicsView):
         super().resizeEvent(event)
         if self._scene.sceneRect().width() > 0:
             self.fitInView(self._scene.sceneRect(), Qt.KeepAspectRatio)
+
+    def wheelEvent(self, event) -> None:  # noqa: ANN001
+        # Plain vertical wheel walks pages. Ctrl+wheel is intentionally a
+        # no-op for now — the existing app does not bind zoom to the
+        # wheel and we don't want to introduce that as a side effect.
+        # Single-page docs clamp to 0 and the call becomes a no-op.
+        if event.modifiers() & (Qt.ControlModifier | Qt.MetaModifier):
+            event.ignore()
+            return
+        delta = event.angleDelta().y()
+        if delta == 0:
+            super().wheelEvent(event)
+            return
+        step = -1 if delta > 0 else 1
+        new_idx = max(0, min(self._doc.page_count - 1, self._page_index + step))
+        if new_idx != self._page_index:
+            self.set_page(new_idx)
+        event.accept()
 
 
 _ALIGN_QT = {

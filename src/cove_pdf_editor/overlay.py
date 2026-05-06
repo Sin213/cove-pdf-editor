@@ -2,13 +2,13 @@
 
 PyMuPDF opens the source PDF, draws each pending edit directly onto the
 matching page (whiteout + replacement glyphs for ``EditText``; positioned
-text for ``FreeText``; placed bitmap for ``ImageEdit``), and writes the
-result. One library, one pass, no overlay+merge dance.
+text for ``FreeText``; placed bitmap for ``ImageEdit``; rounded-rect
+callouts for ``BubbleEdit``), and writes the result. One library, one
+pass, no overlay+merge dance.
 
-Edits are baked into the page content stream. The saved PDF carries no
-annotations, sticky notes, ink, shapes, signatures, form-field updates,
-bookmarks, hyperlinks, watermarks, or headers/footers — the editor never
-produces those.
+Edits are baked into the page content stream. Other typical PDF
+artifacts — sticky notes, ink, form-field updates, bookmarks,
+hyperlinks, watermarks, headers/footers — are not produced.
 """
 from __future__ import annotations
 
@@ -19,7 +19,14 @@ from pathlib import Path
 
 import pymupdf
 
-from .document import Document, EditText, FreeText, ImageEdit
+from .document import (
+    BubbleEdit,
+    Document,
+    EditText,
+    FreeText,
+    ImageEdit,
+    RedactionEdit,
+)
 
 
 def save(doc: Document, out: Path) -> Path:
@@ -54,15 +61,29 @@ def save(doc: Document, out: Path) -> Path:
                 for page_idx in range(doc.page_count):
                     page = pdf[page_idx]
                     page_edits = doc.edits_for_page(page_idx)
+                    # Pass 1 — hard redactions. Black-fill rects whose
+                    # content (text + images + graphics) must be removed
+                    # from the page stream entirely. Run before EditText
+                    # whiteouts so the two passes don't interfere.
+                    hard = False
+                    for edit in page_edits:
+                        if isinstance(edit, RedactionEdit):
+                            rect = _pdf_rect(page, edit.bbox)
+                            page.add_redact_annot(rect, fill=(0, 0, 0))
+                            hard = True
+                    if hard:
+                        page.apply_redactions(images=2, graphics=1)
+                    # Pass 2 — EditText whiteouts. Images and graphics
+                    # are intentionally left alone (``images=0``,
+                    # ``graphics=0``) so a text replacement that
+                    # happens to overlap a logo doesn't delete the
+                    # logo.
                     redacted = False
                     for edit in page_edits:
                         if isinstance(edit, EditText):
                             _queue_redaction(page, edit)
                             redacted = True
                     if redacted:
-                        # Remove the underlying text and stamp a white rect; leave
-                        # images and vector graphics alone (`images=0`,
-                        # `graphics=0`).
                         page.apply_redactions(images=0, graphics=0)
                     # Whiteout the original location of any image promoted from
                     # the source PDF, so the moved/resized/deleted version isn't
@@ -137,6 +158,8 @@ def _draw(page: pymupdf.Page, edit) -> None:
         _draw_freetext(page, edit)
     elif isinstance(edit, ImageEdit):
         _draw_image(page, edit)
+    elif isinstance(edit, BubbleEdit):
+        _draw_bubble(page, edit)
 
 
 # ---------------------------------------------------------------------------
@@ -225,17 +248,201 @@ def _wrap_lines(text: str, max_width: float, fontsize: float, fontname: str) -> 
     return out
 
 
+def _draw_bubble(page: pymupdf.Page, edit: BubbleEdit) -> None:
+    """Bake a numbered balloon callout as vector drawings.
+
+    Output: a filled circle, the number drawn inside, and (if the edit
+    has one) a leader line from the circle edge to ``leader_anchor``
+    with a small arrowhead at the anchor. These are real PDF content
+    streams — the result is not a PDF annotation, so it cannot be
+    edited or removed in other PDF viewers.
+
+    Note: ``edit.text`` (the description) is NOT written to the PDF.
+    Keep descriptions in-session; a future "key page" feature can
+    collect them into a table.
+
+    Skipped when the edit is already baked into the source PDF. The
+    dataclass is kept around after save so the description survives
+    for the Balloon Key page; redrawing here would stamp a second
+    circle on top of the first on every subsequent save.
+    """
+    if getattr(edit, "baked", False):
+        return
+    rect = _pdf_rect(page, edit.bbox)
+    cx = (rect.x0 + rect.x1) / 2
+    cy = (rect.y0 + rect.y1) / 2
+    radius = min(rect.width, rect.height) / 2
+    fill = _to_float(edit.fill_color)
+    border = _to_float(edit.border_color)
+    text_color = _to_float(edit.text_color)
+
+    page_h = page.rect.height
+    if edit.leader_anchor is not None:
+        ax_pt, ay_pt = edit.leader_anchor
+        anchor = pymupdf.Point(ax_pt, page_h - ay_pt)
+        dx = anchor.x - cx
+        dy = anchor.y - cy
+        dist = (dx * dx + dy * dy) ** 0.5
+        if dist > radius + 1:
+            ux, uy = dx / dist, dy / dist
+            edge = pymupdf.Point(cx + ux * radius, cy + uy * radius)
+            page.draw_line(edge, anchor, color=border, width=0.8)
+            # Arrowhead — small filled triangle at the anchor.
+            head_len = 6.0
+            spread = 2.5
+            base = pymupdf.Point(anchor.x - ux * head_len,
+                                 anchor.y - uy * head_len)
+            px, py = -uy, ux
+            p1 = pymupdf.Point(base.x + px * spread, base.y + py * spread)
+            p2 = pymupdf.Point(base.x - px * spread, base.y - py * spread)
+            page.draw_polyline(
+                [anchor, p1, p2, anchor],
+                color=border, fill=border, width=0.5,
+            )
+
+    page.draw_circle(
+        pymupdf.Point(cx, cy), radius,
+        color=border, fill=fill, width=1.0,
+    )
+
+    fontname = _resolve_font(edit.fontname, bold=True)
+    text = str(edit.number)
+    text_w = pymupdf.get_text_length(text, fontsize=edit.fontsize, fontname=fontname)
+    # Eyeballed vertical centering for base-14 fonts: cap height is
+    # roughly 70% of fontsize, so dropping the baseline ~25% below the
+    # circle center reads as centered.
+    page.insert_text(
+        pymupdf.Point(cx - text_w / 2, cy + edit.fontsize * 0.32),
+        text,
+        fontsize=edit.fontsize, fontname=fontname, color=text_color,
+    )
+
+
+def append_balloon_key_pages(
+    pdf_doc: pymupdf.Document,
+    bubbles: list[BubbleEdit],
+) -> int:
+    """Append one or more Letter-size pages summarizing balloon
+    callouts. Each row lists the balloon number, the source page it's
+    on, and the in-session description. Rows are sorted by source page
+    then number. Returns the number of pages appended (0 if there are
+    no bubbles)."""
+    if not bubbles:
+        return 0
+    rows = sorted(bubbles, key=lambda e: (e.page, e.number))
+
+    PW, PH = 612.0, 792.0
+    M = 50.0
+    col_num_x = M + 6
+    col_page_x = M + 50
+    col_desc_x = M + 100
+    desc_w = PW - M - col_desc_x
+    title_size = 20.0
+    header_size = 10.0
+    body_size = 10.0
+    line_h = body_size * 1.35
+
+    pages_added = 0
+
+    def _new_page() -> tuple[pymupdf.Page, float]:
+        nonlocal pages_added
+        page = pdf_doc.new_page(width=PW, height=PH)
+        pages_added += 1
+        # Title (only on the first page; subsequent pages just get a
+        # continuation header so the table flows).
+        if pages_added == 1:
+            page.insert_text(
+                pymupdf.Point(M, M + title_size),
+                "Balloon Key",
+                fontsize=title_size, fontname="Helvetica-Bold",
+                color=(0.15, 0.35, 0.6),
+            )
+            ty = M + title_size + 18
+        else:
+            page.insert_text(
+                pymupdf.Point(M, M + 14),
+                "Balloon Key (continued)",
+                fontsize=12, fontname="Helvetica-Bold",
+                color=(0.4, 0.45, 0.55),
+            )
+            ty = M + 30
+        # Header row: filled band + column labels.
+        page.draw_rect(
+            pymupdf.Rect(M, ty, PW - M, ty + 18),
+            fill=(0.92, 0.94, 0.98), color=(0.4, 0.5, 0.7), width=0.5,
+        )
+        page.insert_text(
+            pymupdf.Point(col_num_x, ty + 13),
+            "#", fontsize=header_size, fontname="Helvetica-Bold",
+        )
+        page.insert_text(
+            pymupdf.Point(col_page_x, ty + 13),
+            "Page", fontsize=header_size, fontname="Helvetica-Bold",
+        )
+        page.insert_text(
+            pymupdf.Point(col_desc_x, ty + 13),
+            "Description", fontsize=header_size, fontname="Helvetica-Bold",
+        )
+        return page, ty + 22
+
+    page, y = _new_page()
+    bottom_limit = PH - M
+
+    for bubble in rows:
+        text = (bubble.text or "(no description)").strip() or "(no description)"
+        wrapped = _wrap_lines(text, desc_w, body_size, "Helvetica")
+        if not wrapped:
+            wrapped = [""]
+        row_h = max(line_h, len(wrapped) * line_h) + 6
+        if y + row_h > bottom_limit:
+            page, y = _new_page()
+        page.insert_text(
+            pymupdf.Point(col_num_x, y + body_size),
+            str(bubble.number),
+            fontsize=body_size, fontname="Helvetica-Bold",
+        )
+        page.insert_text(
+            pymupdf.Point(col_page_x, y + body_size),
+            str(bubble.page + 1),
+            fontsize=body_size, fontname="Helvetica",
+        )
+        for i, line in enumerate(wrapped):
+            page.insert_text(
+                pymupdf.Point(col_desc_x, y + body_size + i * line_h),
+                line,
+                fontsize=body_size, fontname="Helvetica",
+            )
+        y += row_h
+        page.draw_line(
+            pymupdf.Point(M, y),
+            pymupdf.Point(PW - M, y),
+            color=(0.85, 0.88, 0.92), width=0.3,
+        )
+        y += 2
+
+    return pages_added
+
+
 def _draw_image(page: pymupdf.Page, edit: ImageEdit) -> None:
     """Place the bitmap stretched to fill the bbox so the saved output
     matches the on-canvas preview, which uses the same bbox without
     aspect-ratio preservation. ``image_path is None`` is a tombstone for
     a promoted source image the user deleted — the whiteout in
-    ``save()`` already covered the original; nothing else to draw."""
+    ``save()`` already covered the original; nothing else to draw.
+
+    The bytes are fed via ``stream=`` rather than ``filename=`` so a PNG
+    soft-mask (alpha) survives the embed. ``filename=`` can lose the
+    soft-mask depending on the path PyMuPDF takes internally, which
+    flattens transparent areas to opaque black on the saved page."""
     if edit.image_path is None:
         return
     rect = _pdf_rect(page, edit.bbox)
     try:
-        page.insert_image(rect, filename=str(edit.image_path), keep_proportion=False)
+        data = Path(edit.image_path).read_bytes()
+    except OSError:
+        return
+    try:
+        page.insert_image(rect, stream=data, keep_proportion=False)
     except Exception:
         pass
 

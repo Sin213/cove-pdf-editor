@@ -7,13 +7,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QPointF, QRectF, QSettings, Qt
 from PySide6.QtGui import QBrush, QColor, QPen
-from PySide6.QtWidgets import QFileDialog
+from PySide6.QtWidgets import QApplication, QFileDialog
 
 from . import theme
 from .canvas import PageCanvas
-from .document import EditText, FreeText, ImageEdit
+from .document import BubbleEdit, EditText, FreeText, ImageEdit, RedactionEdit
+
+
+_SIGNATURE_PATH_KEY = "signaturePath"
 
 
 # ---------------------------------------------------------------------------
@@ -283,4 +286,148 @@ class AddImageTool(_DragRectTool):
         canvas.select_edit(edit)
         # Hand the canvas back to Select mode so the user can drag,
         # resize, or delete the new image without switching tools.
+        canvas.return_to_select()
+
+
+# ---------------------------------------------------------------------------
+# Signature — image placement specialized for signatures / initials.
+# Recalls the last-used image so repeat-signing one PDF takes one click +
+# one drag instead of one pick + one drag every time. Hold Shift while
+# activating the tool to force a re-pick (e.g. switching from signature
+# to initials).
+# ---------------------------------------------------------------------------
+
+class SignatureTool(AddImageTool):
+    name = "signature"
+
+    def prime(self, canvas: PageCanvas) -> bool:
+        settings = QSettings("Cove", "PdfEditor")
+        last = settings.value(_SIGNATURE_PATH_KEY, "", type=str) or ""
+        force_pick = bool(QApplication.keyboardModifiers() & Qt.ShiftModifier)
+        if last and Path(last).exists() and not force_pick:
+            self._image_path = Path(last)
+            return True
+        path, _ = QFileDialog.getOpenFileName(
+            canvas, "Pick signature image", last,
+            "Images (*.png *.jpg *.jpeg *.gif *.bmp);;All files (*)",
+        )
+        if not path:
+            return False
+        self._image_path = Path(path)
+        settings.setValue(_SIGNATURE_PATH_KEY, str(self._image_path))
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Balloon — engineering-drawing-style numbered callout. Drag from the
+# feature you want to label to wherever you want the balloon to sit; the
+# tool draws a leader line during drag, then prompts for an optional
+# description after release. Just-clicking (no drag) drops a balloon at
+# the click point with no leader.
+# ---------------------------------------------------------------------------
+
+class BubbleTool:
+    name = "bubble"
+
+    SIZE = 24.0       # PDF points — balloon diameter
+    DRAG_PX = 10.0    # scene-pixel threshold below which release is
+                      # treated as a plain click (no leader)
+
+    _PREVIEW_PEN_COLOR = theme.DRAG_PREVIEW_PEN
+
+    def __init__(self) -> None:
+        self._start_pdf: tuple[float, float] | None = None
+        self._preview_line = None  # QGraphicsLineItem during drag
+
+    def press(self, canvas: PageCanvas, qt: QPointF) -> None:
+        self._start_pdf = canvas.coord_map().qt_to_pdf(qt)
+        pen = QPen(self._PREVIEW_PEN_COLOR)
+        pen.setStyle(Qt.DashLine)
+        pen.setWidthF(1.5)
+        self._preview_line = canvas.scene().addLine(
+            qt.x(), qt.y(), qt.x(), qt.y(), pen,
+        )
+        self._preview_line.setZValue(1000)
+
+    def move(self, canvas: PageCanvas, qt: QPointF) -> None:
+        if self._start_pdf is None or self._preview_line is None:
+            return
+        start_qt = canvas.coord_map().pdf_to_qt(*self._start_pdf)
+        self._preview_line.setLine(start_qt.x(), start_qt.y(), qt.x(), qt.y())
+
+    def release(self, canvas: PageCanvas, qt: QPointF) -> None:
+        if self._start_pdf is None:
+            return
+        start = self._start_pdf
+        end_pdf = canvas.coord_map().qt_to_pdf(qt)
+        if self._preview_line is not None:
+            try:
+                canvas.scene().removeItem(self._preview_line)
+            except Exception:  # noqa: BLE001
+                pass
+            self._preview_line = None
+        self._start_pdf = None
+
+        start_qt = canvas.coord_map().pdf_to_qt(*start)
+        delta_px = ((qt.x() - start_qt.x()) ** 2
+                    + (qt.y() - start_qt.y()) ** 2) ** 0.5
+        is_drag = delta_px > self.DRAG_PX
+        if is_drag:
+            leader = start
+            balloon_pt = end_pdf
+        else:
+            leader = None
+            balloon_pt = start
+
+        number = self._next_number(canvas.document())
+
+        from PySide6.QtWidgets import QInputDialog
+        text, ok = QInputDialog.getMultiLineText(
+            canvas,
+            f"Balloon #{number}",
+            "Description (in-session, not saved to PDF):",
+            "",
+        )
+        if not ok:
+            canvas.return_to_select()
+            return
+
+        s = self.SIZE
+        bbox = (
+            balloon_pt[0] - s / 2, balloon_pt[1] - s / 2,
+            balloon_pt[0] + s / 2, balloon_pt[1] + s / 2,
+        )
+        edit = BubbleEdit(
+            page=canvas.page_index(),
+            bbox=bbox,
+            number=number,
+            leader_anchor=leader,
+            text=text,
+        )
+        canvas.add_edit(edit)
+        canvas.select_edit(edit)
+        canvas.return_to_select()
+
+    @staticmethod
+    def _next_number(document) -> int:  # noqa: ANN001
+        existing = [
+            e.number for e in document.edits if isinstance(e, BubbleEdit)
+        ]
+        return (max(existing) + 1) if existing else 1
+
+
+# ---------------------------------------------------------------------------
+# Redact — drag a rectangle over content that must be removed from the
+# saved PDF. On save, ``apply_redactions`` strips text + images +
+# graphics inside the rect from the page content stream and stamps it
+# black; the result is irrecoverable.
+# ---------------------------------------------------------------------------
+
+class RedactTool(_DragRectTool):
+    name = "redact"
+
+    def _commit(self, canvas: PageCanvas, bbox) -> None:
+        edit = RedactionEdit(page=canvas.page_index(), bbox=bbox)
+        canvas.add_edit(edit)
+        canvas.select_edit(edit)
         canvas.return_to_select()
