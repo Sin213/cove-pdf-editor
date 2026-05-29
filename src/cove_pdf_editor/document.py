@@ -8,6 +8,7 @@ mutation.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections import defaultdict
 from pathlib import Path
 from typing import Literal
 
@@ -131,8 +132,27 @@ class Document:
     edits: list[Edit] = field(default_factory=list)
     dirty: bool = False
 
+    def __post_init__(self) -> None:
+        # Page-indexed lookup: rebuilt lazily in _rebuild_index().
+        # Kept in sync by add() / remove(). Direct mutation of
+        # ``edits`` (e.g. bulk-clear on save) must call _rebuild_index().
+        self._page_index: dict[int, list[Edit]] = defaultdict(list)
+        for edit in self.edits:
+            self._page_index[edit.page].append(edit)
+
+    def _rebuild_index(self) -> None:
+        """Rebuild the page index from scratch.
+
+        Call this whenever ``edits`` is replaced or bulk-mutated
+        (e.g. after save clears the list).
+        """
+        self._page_index = defaultdict(list)
+        for edit in self.edits:
+            self._page_index[edit.page].append(edit)
+
     def add(self, edit: Edit) -> None:
         self.edits.append(edit)
+        self._page_index[edit.page].append(edit)
         self.dirty = True
 
     def remove(self, edit: Edit) -> None:
@@ -140,7 +160,13 @@ class Document:
             self.edits.remove(edit)
             self.dirty = True
         except ValueError:
-            pass
+            return
+        page_list = self._page_index.get(edit.page)
+        if page_list is not None:
+            try:
+                page_list.remove(edit)
+            except ValueError:
+                pass
 
     def edits_for_page(self, page: int) -> list[Edit]:
-        return [e for e in self.edits if e.page == page]
+        return list(self._page_index.get(page, []))

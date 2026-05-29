@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 import pymupdf
 import pypdfium2 as pdfium
@@ -1174,7 +1177,8 @@ class MainWindow(QMainWindow):
         try:
             with pdfium.PdfDocument(str(path)) as doc:
                 n = len(doc)
-        except Exception as exc:  # noqa: BLE001
+        except (OSError, ValueError, RuntimeError) as exc:
+            log.warning("Could not open PDF %s: %s", path, exc)
             QMessageBox.critical(self, "Could not open PDF", str(exc))
             return
         document = Document(source=path, page_count=n)
@@ -1483,7 +1487,8 @@ class MainWindow(QMainWindow):
         saved_path = Path(path)
         try:
             save(tab.doc, saved_path)
-        except Exception as exc:  # noqa: BLE001
+        except (OSError, RuntimeError, ValueError) as exc:
+            log.error("Save failed for %s: %s", saved_path, exc)
             QMessageBox.critical(self, "Save failed", str(exc))
             return
         # Rebase the in-memory document onto the saved file. Without
@@ -1518,6 +1523,7 @@ class MainWindow(QMainWindow):
                 e.baked = True
                 preserved.append(e)
         tab.doc.edits = preserved
+        tab.doc._rebuild_index()
         tab.doc.dirty = False
         # The canvas still holds EditObjectItems and undo / redo
         # snapshots that reference the just-cleared edits. Reset it so
@@ -1561,7 +1567,8 @@ class MainWindow(QMainWindow):
         tmp = Path(tmp_name)
         try:
             save(tab.doc, tmp)
-        except Exception as exc:  # noqa: BLE001
+        except (OSError, RuntimeError, ValueError) as exc:
+            log.error("Print pre-render save failed: %s", exc)
             QMessageBox.critical(self, "Print failed", str(exc))
             tmp.unlink(missing_ok=True)
             return
@@ -1605,7 +1612,8 @@ class MainWindow(QMainWindow):
                         sub.save(str(out_path), garbage=4, deflate=True)
                         sub.close()
                     self._status.showMessage(f"Saved {out_path.name}", 8000)
-                except Exception as exc:  # noqa: BLE001
+                except (OSError, RuntimeError, ValueError) as exc:
+                    log.error("Print page-range export failed: %s", exc)
                     QMessageBox.critical(self, "Print failed", str(exc))
                 finally:
                     tmp.unlink(missing_ok=True)
@@ -1705,14 +1713,16 @@ class MainWindow(QMainWindow):
                         data = path.read_bytes()
                         page.insert_image(rect, stream=data, keep_proportion=False)
                         appended += 1
-                    except Exception:  # noqa: BLE001
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        log.warning("Could not insert image %s: %s", path.name, exc)
                         skipped.append(path.name)
                         # Drop the empty page so we don't ship a blank.
                         src.delete_page(src.page_count - 1)
                 if appended == 0:
                     raise RuntimeError("no images could be imported")
                 src.save(str(new_path), garbage=4, deflate=True)
-        except Exception as exc:  # noqa: BLE001
+        except (OSError, RuntimeError, ValueError) as exc:
+            log.error("Image import failed: %s", exc)
             shutil.rmtree(new_dir, ignore_errors=True)
             QMessageBox.critical(self, "Could not insert images", str(exc))
             return

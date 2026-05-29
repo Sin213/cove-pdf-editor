@@ -37,3 +37,10 @@ RELEASES.md
 
 # Local archives / generated files
 *.zip
+AGENTS.md
+.claudeignore
+
+.codex-reviews/
+
+# Session aids (orientation snapshots)
+*-orientation.md

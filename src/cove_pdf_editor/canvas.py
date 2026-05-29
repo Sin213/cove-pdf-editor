@@ -13,8 +13,11 @@ writer without further transforms.
 from __future__ import annotations
 
 import copy
+import logging
 from dataclasses import dataclass
 from typing import Protocol
+
+log = logging.getLogger(__name__)
 
 from PySide6.QtCore import QPointF, QRectF, QSizeF, Qt, Signal
 from PySide6.QtGui import (
@@ -54,6 +57,7 @@ from .render import (
     extract_images,
     extract_spans,
     image_at,
+    invalidate_render_cache,
     page_info,
     render_page,
     span_at,
@@ -1078,13 +1082,16 @@ class PageCanvas(QGraphicsView):
         if self._active_editor is not None:
             try:
                 self._scene.removeItem(self._active_editor)
-            except Exception:  # noqa: BLE001
-                pass
+            except RuntimeError as exc:
+                log.warning("Could not remove active editor from scene: %s", exc)
         self._active_editor = None
         self._editing_edit = None
         self._undo_stack.clear()
         self._redo_stack.clear()
         self._promoted_image_paths.clear()
+        # Evict stale cached renders so the page is re-rendered from the
+        # freshly-saved source PDF rather than served from the pre-save cache.
+        invalidate_render_cache(self._doc.source)
         idx = self._page_index if 0 <= self._page_index < self._doc.page_count else 0
         self._load_page(idx)
         self._emit_selection()
@@ -1167,7 +1174,8 @@ class PageCanvas(QGraphicsView):
         tmp = Path(tempfile.gettempdir()) / f"cove-promoted-{id(self)}-{src.xref}.{ext}"
         try:
             tmp.write_bytes(src.image_bytes)
-        except Exception:
+        except OSError as exc:
+            log.warning("Could not write promoted image xref=%d to %s: %s", src.xref, tmp, exc)
             return None
         self._promoted_image_paths[src.xref] = tmp
         return tmp
@@ -1323,8 +1331,8 @@ class PageCanvas(QGraphicsView):
             for it in (item, whiteout, border):
                 try:
                     self._scene.removeItem(it)
-                except Exception:
-                    pass
+                except RuntimeError as exc:
+                    log.warning("Could not remove editor item from scene: %s", exc)
             self._editing_edit = None
             self._active_editor = None
             self._refresh_overlay()

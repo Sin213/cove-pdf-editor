@@ -10,6 +10,8 @@ to a "no editable text here" message at the tool layer.
 """
 from __future__ import annotations
 
+import logging
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,6 +19,17 @@ import pymupdf
 import pypdfium2 as pdfium
 from PIL import Image
 from PySide6.QtGui import QImage
+
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Page-render cache: keyed by (resolved source path, page_index, scale).
+# Capped at 32 entries (roughly 4 pages × 8 scale variants) so that long
+# documents don't pin memory indefinitely. The oldest entry is evicted when
+# the limit is reached.
+# ---------------------------------------------------------------------------
+_RENDER_CACHE: OrderedDict[tuple[str, int, float], QImage] = OrderedDict()
+_RENDER_CACHE_MAX = 32
 
 
 # PyMuPDF font flag bits (matches mupdf docs).
@@ -60,10 +73,34 @@ def page_info(source: Path, page_index: int) -> PageInfo:
 
 
 def render_page(source: Path, page_index: int, scale: float = 2.0) -> QImage:
+    cache_key = (str(source.resolve()), page_index, scale)
+    cached = _RENDER_CACHE.get(cache_key)
+    if cached is not None:
+        _RENDER_CACHE.move_to_end(cache_key)
+        return cached
     with pdfium.PdfDocument(str(source)) as doc:
         page = doc[page_index]
         pil = page.render(scale=scale).to_pil().convert("RGB")
-        return _pil_to_qimage(pil)
+        image = _pil_to_qimage(pil)
+    if len(_RENDER_CACHE) >= _RENDER_CACHE_MAX:
+        _RENDER_CACHE.popitem(last=False)
+    _RENDER_CACHE[cache_key] = image
+    return image
+
+
+def invalidate_render_cache(source: Path | None = None) -> None:
+    """Evict cached renders for *source* (or all entries if None).
+
+    Call this after a save so the canvas picks up the freshly-written
+    pixels rather than serving the pre-save render from cache.
+    """
+    if source is None:
+        _RENDER_CACHE.clear()
+        return
+    key_prefix = str(source.resolve())
+    stale = [k for k in _RENDER_CACHE if k[0] == key_prefix]
+    for k in stale:
+        del _RENDER_CACHE[k]
 
 
 def extract_spans(source: Path, page_index: int) -> list[PageSpan]:
@@ -126,7 +163,8 @@ def extract_images(source: Path, page_index: int) -> list[PageImage]:
             if xref not in seen_xrefs:
                 try:
                     seen_xrefs[xref] = doc.extract_image(xref)
-                except Exception:
+                except (RuntimeError, ValueError) as exc:
+                    log.warning("Could not extract image xref=%d: %s", xref, exc)
                     continue
             data = seen_xrefs[xref]
             for rect in page.get_image_rects(xref):

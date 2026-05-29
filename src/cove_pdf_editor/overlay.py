@@ -12,12 +12,15 @@ hyperlinks, watermarks, headers/footers — are not produced.
 """
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import tempfile
 from pathlib import Path
 
 import pymupdf
+
+log = logging.getLogger(__name__)
 
 from .document import (
     BubbleEdit,
@@ -109,7 +112,8 @@ def save(doc: Document, out: Path) -> Path:
         # before we replace, so Windows can swing the rename and the
         # destination is never partially written.
         os.replace(str(tmp_path), str(out))
-    except Exception:
+    except (OSError, RuntimeError, ValueError) as exc:
+        log.error("Save to %s failed, removing temp file: %s", out, exc)
         try:
             tmp_path.unlink()
         except OSError:
@@ -443,8 +447,8 @@ def _draw_image(page: pymupdf.Page, edit: ImageEdit) -> None:
         return
     try:
         page.insert_image(rect, stream=data, keep_proportion=False)
-    except Exception:
-        pass
+    except (RuntimeError, ValueError) as exc:
+        log.warning("Could not insert image %s into page: %s", edit.image_path, exc)
 
 
 # ---------------------------------------------------------------------------
