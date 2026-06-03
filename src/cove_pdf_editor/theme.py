@@ -384,6 +384,33 @@ QLabel#SectionCount {{
     padding: 0 4px;
 }}
 
+/* ---- Page go-to row --------------------------------------------- */
+QFrame#PageGoRow {{
+    background: transparent;
+    border: none;
+}}
+QLabel#PageGoLabel {{
+    background: transparent;
+    color: {TEXT_FAINT};
+    font-size: 11px;
+}}
+QSpinBox#PageSpin {{
+    background: {BG};
+    color: {TEXT};
+    border: 1px solid {BORDER};
+    border-radius: {RADIUS_SM};
+    padding: 2px 6px;
+    min-height: 22px;
+    font-size: 12px;
+}}
+QSpinBox#PageSpin:focus {{
+    border: 1px solid {ACCENT};
+}}
+QSpinBox#PageSpin:disabled {{
+    color: {TEXT_FAINT};
+    background: {SURFACE};
+}}
+
 /* ---- Pages empty card ------------------------------------------- */
 QFrame#PagesEmpty {{
     background: transparent;

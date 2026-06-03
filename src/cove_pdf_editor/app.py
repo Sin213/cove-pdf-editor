@@ -81,9 +81,8 @@ _IMAGE_FILTER = "Images (*.png *.jpg *.jpeg *.gif *.bmp);;All files (*)"
 # Default page size for imported images that are smaller than Letter at
 # 72 dpi — image is centered onto the page with aspect preserved.
 _DEFAULT_PAGE_PT = (612.0, 792.0)
-# Cap a single import operation. 50 high-res photos already costs a lot
-# of memory and disk; beyond that we'd rather warn the user.
-_MAX_IMAGE_IMPORT = 50
+# Soft warning threshold for large image imports (no hard cap).
+_IMAGE_IMPORT_WARN = 100
 
 # Recent-documents store. Persists across launches via QSettings; only
 # absolute file paths are stored (no contents, hashes, or extra metadata).
@@ -199,10 +198,20 @@ class _PageList(QListWidget):
     """
 
     imagesDropped = Signal(list)
+    deletePageRequested = Signal(int)
 
     def __init__(self, parent=None) -> None:  # noqa: ANN001
         super().__init__(parent)
         self.setAcceptDrops(True)
+
+    def keyPressEvent(self, event) -> None:  # noqa: ANN001
+        if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            row = self.currentRow()
+            if row >= 0:
+                self.deletePageRequested.emit(row)
+                event.accept()
+                return
+        super().keyPressEvent(event)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if self._image_paths(event):
@@ -552,6 +561,26 @@ class MainWindow(QMainWindow):
             self._make_section_row("PAGES", count_widget=self._pages_count_label)
         )
 
+        # Quick page-jump spinner
+        go_row = QFrame()
+        go_row.setObjectName("PageGoRow")
+        go_lay = QHBoxLayout(go_row)
+        go_lay.setContentsMargins(4, 0, 4, 0)
+        go_lay.setSpacing(6)
+        go_lbl = QLabel("Go to")
+        go_lbl.setObjectName("PageGoLabel")
+        go_lay.addWidget(go_lbl)
+        self._page_spin = QSpinBox()
+        self._page_spin.setObjectName("PageSpin")
+        self._page_spin.setMinimum(1)
+        self._page_spin.setMaximum(1)
+        self._page_spin.setKeyboardTracking(False)
+        self._page_spin.valueChanged.connect(
+            lambda v: self.page_list.setCurrentRow(v - 1)
+        )
+        go_lay.addWidget(self._page_spin, stretch=1)
+        pages_lay.addWidget(go_row)
+
         # Stack: empty card vs. populated page list. Switched in
         # _set_pages_count().
         self._pages_stack = QStackedWidget()
@@ -562,6 +591,7 @@ class MainWindow(QMainWindow):
         self.page_list.setObjectName("PageList")
         self.page_list.currentRowChanged.connect(self._on_page_changed)
         self.page_list.imagesDropped.connect(self._insert_image_paths_as_pages)
+        self.page_list.deletePageRequested.connect(self._delete_page)
         self.page_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._pages_stack.addWidget(self.page_list)
         pages_lay.addWidget(self._pages_stack, stretch=1)
@@ -675,6 +705,8 @@ class MainWindow(QMainWindow):
 
     def _set_pages_count(self, n: int) -> None:
         self._pages_count_label.setText(str(n))
+        self._page_spin.setMaximum(max(n, 1))
+        self._page_spin.setEnabled(n > 0)
         if n > 0:
             self._pages_stack.setCurrentWidget(self.page_list)
         else:
@@ -1685,12 +1717,11 @@ class MainWindow(QMainWindow):
         if not clean:
             self._status.showMessage("No supported images selected.", 6000)
             return
-        if len(clean) > _MAX_IMAGE_IMPORT:
+        if len(clean) > _IMAGE_IMPORT_WARN:
             self._status.showMessage(
-                f"Importing first {_MAX_IMAGE_IMPORT} of {len(clean)} images.",
+                f"Importing {len(clean)} images — this may take a moment.",
                 8000,
             )
-            clean = clean[:_MAX_IMAGE_IMPORT]
 
         # Capture any in-flight inline edit so the user's typed text is
         # not dropped when we re-render the canvas from the new source.
@@ -1759,6 +1790,67 @@ class MainWindow(QMainWindow):
         if skipped:
             msg += f" ({len(skipped)} skipped)"
         self._status.showMessage(msg, 8000)
+
+    # ----------------------------------------------- page deletion
+
+    def _delete_page(self, page_idx: int) -> None:
+        """Remove a single page from the active document via rebase."""
+        if self._doc is None or self._canvas is None:
+            return
+        if self._doc.page_count <= 1:
+            self._status.showMessage("Cannot delete the only page.", 6000)
+            return
+
+        self._canvas.commit_active_editor()
+
+        new_dir = Path(tempfile.mkdtemp(prefix="cove-del-"))
+        new_path = new_dir / self._doc.source.name
+        try:
+            with pymupdf.open(str(self._doc.source)) as src:
+                src.delete_page(page_idx)
+                src.save(str(new_path), garbage=4, deflate=True)
+        except (OSError, RuntimeError, ValueError) as exc:
+            log.error("Page deletion failed: %s", exc)
+            shutil.rmtree(new_dir, ignore_errors=True)
+            self._status.showMessage(f"Could not delete page: {exc}", 8000)
+            return
+
+        tab = self._active_tab()
+        if tab is None:
+            shutil.rmtree(new_dir, ignore_errors=True)
+            return
+        self._discard_blank_tmp_dir(tab)
+        tab.blank_tmp_dir = new_dir
+
+        self._doc.edits = [
+            e for e in self._doc.edits if e.page != page_idx
+        ]
+        for e in self._doc.edits:
+            if e.page > page_idx:
+                e.page -= 1
+        self._doc._rebuild_index()
+
+        new_count = self._doc.page_count - 1
+        self._doc.source = new_path
+        self._doc.page_count = new_count
+        self._doc.dirty = True
+
+        self.page_list.blockSignals(True)
+        self.page_list.clear()
+        for i in range(new_count):
+            self.page_list.addItem(f"Page {i + 1}")
+        self.page_list.blockSignals(False)
+        self._set_pages_count(new_count)
+
+        target = min(page_idx, new_count - 1)
+        self.page_list.setCurrentRow(target)
+
+        self._canvas.reset_for_saved_source()
+        self._refresh_tab_label(tab)
+        self._update_window_title()
+        self._status.showMessage(
+            f"Deleted page {page_idx + 1} ({new_count} remaining).", 6000,
+        )
 
     # ----------------------------------------------- balloon key page
 
@@ -1976,6 +2068,9 @@ class MainWindow(QMainWindow):
         if self._doc is not None and row >= 0:
             self._set_status_page(row + 1, self._doc.page_count)
             self._update_crumb(self._doc.source.name, f"page {row + 1}")
+            self._page_spin.blockSignals(True)
+            self._page_spin.setValue(row + 1)
+            self._page_spin.blockSignals(False)
 
     def _on_canvas_page_changed(self, idx: int) -> None:
         if self._doc is None or idx < 0 or idx >= self._doc.page_count:
@@ -1983,6 +2078,9 @@ class MainWindow(QMainWindow):
         self.page_list.blockSignals(True)
         self.page_list.setCurrentRow(idx)
         self.page_list.blockSignals(False)
+        self._page_spin.blockSignals(True)
+        self._page_spin.setValue(idx + 1)
+        self._page_spin.blockSignals(False)
         self._set_status_page(idx + 1, self._doc.page_count)
         self._update_crumb(self._doc.source.name, f"page {idx + 1}")
 
