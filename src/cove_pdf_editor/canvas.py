@@ -1026,6 +1026,7 @@ class PageCanvas(QGraphicsView):
         if len(self._redo_stack) > self.UNDO_LIMIT:
             self._redo_stack.pop(0)
         self._doc.edits = self._undo_stack.pop()
+        self._doc._rebuild_index()
         self._doc.dirty = True
         self._refresh_overlay()
         self._emit_selection()
@@ -1040,6 +1041,7 @@ class PageCanvas(QGraphicsView):
         if len(self._undo_stack) > self.UNDO_LIMIT:
             self._undo_stack.pop(0)
         self._doc.edits = self._redo_stack.pop()
+        self._doc._rebuild_index()
         self._doc.dirty = True
         self._refresh_overlay()
         self._emit_selection()

@@ -60,10 +60,13 @@ def save(doc: Document, out: Path) -> Path:
             with open(doc.source, "rb") as src, open(tmp_path, "wb") as dst:
                 shutil.copyfileobj(src, dst, length=1024 * 1024)
         else:
-            with pymupdf.open(str(doc.source)) as pdf:
+            shutil.copy2(str(doc.source), str(tmp_path))
+            with pymupdf.open(str(tmp_path)) as pdf:
                 for page_idx in range(doc.page_count):
                     page = pdf[page_idx]
                     page_edits = doc.edits_for_page(page_idx)
+                    if not page_edits:
+                        continue
                     # Pass 1 — hard redactions. Black-fill rects whose
                     # content (text + images + graphics) must be removed
                     # from the page stream entirely. Run before EditText
@@ -76,11 +79,7 @@ def save(doc: Document, out: Path) -> Path:
                             hard = True
                     if hard:
                         page.apply_redactions(images=2, graphics=1)
-                    # Pass 2 — EditText whiteouts. Images and graphics
-                    # are intentionally left alone (``images=0``,
-                    # ``graphics=0``) so a text replacement that
-                    # happens to overlap a logo doesn't delete the
-                    # logo.
+                    # Pass 2 — EditText whiteouts.
                     redacted = False
                     for edit in page_edits:
                         if isinstance(edit, EditText):
@@ -94,15 +93,13 @@ def save(doc: Document, out: Path) -> Path:
                     for edit in page_edits:
                         if isinstance(edit, ImageEdit) and edit.original_bbox is not None:
                             rect = _pdf_rect(page, edit.original_bbox)
-                            # Slight outward pad so antialiased edges of the
-                            # baked-in original image don't peek out.
                             pad = 1.5
                             rect = pymupdf.Rect(rect.x0 - pad, rect.y0 - pad,
                                                 rect.x1 + pad, rect.y1 + pad)
                             page.draw_rect(rect, color=(1, 1, 1), fill=(1, 1, 1), width=0)
                     for edit in page_edits:
                         _draw(page, edit)
-                pdf.save(str(tmp_path), garbage=4, deflate=True)
+                pdf.saveIncr()
         # ``mkstemp`` opens the temp file with mode 0600. Without this
         # adjustment, ``os.replace`` would silently make the destination
         # owner-only — surprising for shared/readable PDFs and for new
@@ -144,7 +141,6 @@ def _align_dest_mode(tmp_path: Path, out: Path) -> None:
 
 
 def _queue_redaction(page: pymupdf.Page, edit: EditText) -> None:
-    # Always redact the source area (original_bbox); bbox may have moved.
     bbox = edit.original_bbox or edit.bbox
     rect = _pdf_rect(page, bbox)
     pad = 0.5
@@ -170,22 +166,63 @@ def _draw(page: pymupdf.Page, edit) -> None:
 # Drawing
 # ---------------------------------------------------------------------------
 
+_font_cache: dict[str, pymupdf.Font] = {}
+
+
+def _make_font(name: str) -> pymupdf.Font:
+    """Return a cached ``pymupdf.Font`` for the built-in font *name*."""
+    f = _font_cache.get(name)
+    if f is None:
+        f = pymupdf.Font(name)
+        _font_cache[name] = f
+    return f
+
+
+def _wrap_lines_font(
+    text: str, max_width: float, fontsize: float, font: pymupdf.Font,
+) -> list[str]:
+    """Like ``_wrap_lines`` but measures with ``Font.text_length`` so
+    non-ASCII characters are measured correctly."""
+    out: list[str] = []
+    space_w = font.text_length(" ", fontsize=fontsize)
+    for paragraph in text.split("\n"):
+        if not paragraph:
+            out.append("")
+            continue
+        current: list[str] = []
+        current_w = 0.0
+        for word in paragraph.split(" "):
+            word_w = font.text_length(word, fontsize=fontsize)
+            if not current:
+                current = [word]
+                current_w = word_w
+            elif current_w + space_w + word_w <= max_width:
+                current.append(word)
+                current_w += space_w + word_w
+            else:
+                out.append(" ".join(current))
+                current = [word]
+                current_w = word_w
+        out.append(" ".join(current))
+    return out
+
+
 def _draw_edit_text(page: pymupdf.Page, edit: EditText) -> None:
     """Draw the replacement text. The whiteout was already done by
     ``apply_redactions``; this just inserts new glyphs in the same bbox,
-    shrinking the size to fit if needed."""
+    shrinking the size to fit if needed.  Uses ``TextWriter`` + ``Font``
+    so that non-ASCII characters (em-dash, curly quotes, etc.) survive
+    the round-trip — ``insert_text`` silently corrupts them."""
     rect = _pdf_rect(page, edit.bbox)
     fontname = _resolve_font(edit.fontname, bold=edit.bold, italic=edit.italic)
+    font = _make_font(fontname)
     size = edit.fontsize
-    while size > 6 and pymupdf.get_text_length(
-        edit.new_text, fontsize=size, fontname=fontname,
-    ) > rect.width:
+    while size > 6 and font.text_length(edit.new_text, fontsize=size) > rect.width:
         size -= 0.5
     baseline = pymupdf.Point(rect.x0, rect.y1 - size * 0.2)
-    page.insert_text(
-        baseline, edit.new_text,
-        fontsize=size, fontname=fontname, color=_to_float(edit.color),
-    )
+    tw = pymupdf.TextWriter(page.rect)
+    tw.append(baseline, edit.new_text, font=font, fontsize=size)
+    tw.write_text(page, color=_to_float(edit.color))
 
 
 def _draw_freetext(page: pymupdf.Page, edit: FreeText) -> None:
@@ -193,17 +230,20 @@ def _draw_freetext(page: pymupdf.Page, edit: FreeText) -> None:
     underline. Word-wraps to the bbox width so saved output matches the
     on-canvas editor (which uses ``setTextWidth``). Each line is
     positioned manually so the underline width can match the actual
-    rendered text run."""
+    rendered text run.  Uses ``TextWriter`` so non-ASCII characters
+    survive."""
     rect = _pdf_rect(page, edit.bbox)
     fontname = _resolve_font(edit.fontname, bold=edit.bold, italic=edit.italic)
+    font = _make_font(fontname)
     color = _to_float(edit.color)
     line_h = edit.fontsize * 1.2
     underline_dy = edit.fontsize * 0.15
     underline_w = max(0.5, edit.fontsize * 0.06)
-    lines = _wrap_lines(edit.text, rect.width, edit.fontsize, fontname)
+    lines = _wrap_lines_font(edit.text, rect.width, edit.fontsize, font)
+    tw = pymupdf.TextWriter(page.rect)
     for i, line in enumerate(lines):
         baseline_y = rect.y0 + edit.fontsize + line_h * i
-        text_w = pymupdf.get_text_length(line, fontsize=edit.fontsize, fontname=fontname)
+        text_w = font.text_length(line, fontsize=edit.fontsize)
         if edit.align == "center":
             cx = (rect.x0 + rect.x1) / 2
             x = cx - text_w / 2
@@ -211,16 +251,14 @@ def _draw_freetext(page: pymupdf.Page, edit: FreeText) -> None:
             x = rect.x1 - text_w
         else:
             x = rect.x0
-        page.insert_text(
-            pymupdf.Point(x, baseline_y), line,
-            fontsize=edit.fontsize, fontname=fontname, color=color,
-        )
+        tw.append(pymupdf.Point(x, baseline_y), line, font=font, fontsize=edit.fontsize)
         if edit.underline and line:
             yu = baseline_y + underline_dy
             page.draw_line(
                 pymupdf.Point(x, yu), pymupdf.Point(x + text_w, yu),
                 color=color, width=underline_w,
             )
+    tw.write_text(page, color=color)
 
 
 def _wrap_lines(text: str, max_width: float, fontsize: float, fontname: str) -> list[str]:
@@ -310,16 +348,15 @@ def _draw_bubble(page: pymupdf.Page, edit: BubbleEdit) -> None:
     )
 
     fontname = _resolve_font(edit.fontname, bold=True)
+    font = _make_font(fontname)
     text = str(edit.number)
-    text_w = pymupdf.get_text_length(text, fontsize=edit.fontsize, fontname=fontname)
-    # Eyeballed vertical centering for base-14 fonts: cap height is
-    # roughly 70% of fontsize, so dropping the baseline ~25% below the
-    # circle center reads as centered.
-    page.insert_text(
+    text_w = font.text_length(text, fontsize=edit.fontsize)
+    tw = pymupdf.TextWriter(page.rect)
+    tw.append(
         pymupdf.Point(cx - text_w / 2, cy + edit.fontsize * 0.32),
-        text,
-        fontsize=edit.fontsize, fontname=fontname, color=text_color,
+        text, font=font, fontsize=edit.fontsize,
     )
+    tw.write_text(page, color=text_color)
 
 
 def append_balloon_key_pages(
@@ -469,34 +506,31 @@ def _to_float(color: tuple[int, int, int]) -> tuple[float, float, float]:
 
 
 def _resolve_font(name: str, bold: bool = False, italic: bool = False) -> str:
-    """Pick a base-14 font name honoring explicit bold/italic flags and any
-    flags hinted by the source font name."""
+    """Pick a pymupdf built-in font name honoring explicit bold/italic flags
+    and any flags hinted by the source font name.  Built-in fonts (helv, tiro,
+    fimo) embed a Unicode-capable subset, so characters like em-dash survive
+    the round-trip — unlike PDF base-14 fonts which are limited to
+    WinAnsiEncoding."""
     clean = name.split("+")[-1] if "+" in name else name
     lower = clean.lower()
     if "courier" in lower or "mono" in lower:
-        family = "Courier"
+        family = "fi"
     elif "times" in lower or "serif" in lower:
-        family = "Times"
+        family = "ti"
     else:
-        family = "Helvetica"
+        family = "he"
     if "bold" in lower or "black" in lower or "heavy" in lower:
         bold = True
     if "italic" in lower or "oblique" in lower:
         italic = True
-    if family == "Times":
-        return ("Times-BoldItalic" if bold and italic
-                else "Times-Bold" if bold
-                else "Times-Italic" if italic
-                else "Times-Roman")
-    if family == "Courier":
-        return ("Courier-BoldOblique" if bold and italic
-                else "Courier-Bold" if bold
-                else "Courier-Oblique" if italic
-                else "Courier")
-    return ("Helvetica-BoldOblique" if bold and italic
-            else "Helvetica-Bold" if bold
-            else "Helvetica-Oblique" if italic
-            else "Helvetica")
+    if bold and italic:
+        return family + "bi"
+    if bold:
+        return family + "bo"
+    if italic:
+        return family + "it"
+    # Regular variants have unique suffixes per family.
+    return {"he": "helv", "ti": "tiro", "fi": "fimo"}[family]
 
 
 def export_pages(doc: Document, pages: list[int], out: Path) -> None:
@@ -509,7 +543,7 @@ def export_pages(doc: Document, pages: list[int], out: Path) -> None:
         save(doc, tmp_path)
         pdf = pymupdf.open(str(tmp_path))
         pdf.select(pages)
-        pdf.save(str(out), garbage=4, deflate=True)
+        pdf.save(str(out), garbage=2, deflate=True)
         pdf.close()
     finally:
         tmp_path.unlink(missing_ok=True)
