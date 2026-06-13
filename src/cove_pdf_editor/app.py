@@ -53,6 +53,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__, theme, updater
+from .portable import is_portable, portable_data_dir
 from .canvas import PageCanvas
 from .chrome import CoveTitleBar, FramelessResizer
 from .document import BubbleEdit, Document, FreeText, RedactionEdit
@@ -1351,10 +1352,9 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _settings() -> QSettings:
-        # Org/app names match what __main__.py installs on the
-        # QApplication, so QSettings() defaults would also work — but
-        # being explicit keeps the store readable independent of init
-        # order.
+        if is_portable():
+            _portable_dir = portable_data_dir("cove-pdf-editor")
+            return QSettings(os.path.join(_portable_dir, "settings.ini"), QSettings.IniFormat)
         return QSettings("Cove", "PdfEditor")
 
     def _recent_files(self) -> list[Path]:

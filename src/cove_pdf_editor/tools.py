@@ -5,6 +5,7 @@ The ``Tool`` protocol is defined in :mod:`canvas`; tools here just need
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from PySide6.QtCore import QPointF, QRectF, QSettings, Qt
@@ -12,6 +13,7 @@ from PySide6.QtGui import QBrush, QColor, QPen
 from PySide6.QtWidgets import QApplication, QFileDialog
 
 from . import theme
+from .portable import is_portable, portable_data_dir
 from .canvas import PageCanvas
 from .document import BubbleEdit, EditText, FreeText, ImageEdit, RedactionEdit
 
@@ -301,7 +303,11 @@ class SignatureTool(AddImageTool):
     name = "signature"
 
     def prime(self, canvas: PageCanvas) -> bool:
-        settings = QSettings("Cove", "PdfEditor")
+        if is_portable():
+            _portable_dir = portable_data_dir("cove-pdf-editor")
+            settings = QSettings(os.path.join(_portable_dir, "settings.ini"), QSettings.IniFormat)
+        else:
+            settings = QSettings("Cove", "PdfEditor")
         last = settings.value(_SIGNATURE_PATH_KEY, "", type=str) or ""
         force_pick = bool(QApplication.keyboardModifiers() & Qt.ShiftModifier)
         if last and Path(last).exists() and not force_pick:
