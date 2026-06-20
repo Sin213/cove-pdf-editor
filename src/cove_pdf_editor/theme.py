@@ -20,6 +20,7 @@ SURFACE_3     = "#1f1f2b"
 
 # Borders. Hex equivalents of rgba(255,255,255,0.06) / 0.10 over BG.
 BORDER        = "#1c1c26"
+WINDOW_EDGE   = "rgba(255, 255, 255, 0.18)"  # visible outer border on frameless QMainWindow
 BORDER_STRONG = "#25252f"
 
 # Text tier.
@@ -76,7 +77,10 @@ VIEW_BG_HEX       = BG
 
 GLOBAL_QSS = f"""
 /* ---- Window + central -------------------------------------------- */
-QMainWindow {{ background: {BG}; }}
+QMainWindow {{
+    background: {BG};
+    border: 4px solid {WINDOW_EDGE};
+}}
 QMainWindow::separator {{ background: {BORDER}; width: 1px; height: 1px; }}
 
 /* ---- Status bar -------------------------------------------------- */

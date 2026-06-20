@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QMenuBar,
     QMessageBox,
     QPushButton,
+    QSizeGrip,
     QSizePolicy,
     QSpinBox,
     QStackedWidget,
@@ -405,6 +406,11 @@ class MainWindow(QMainWindow):
             self.setWindowIcon(QIcon(str(ICON_PATH)))
         self.setWindowFlags(self.windowFlags() | Qt.FramelessWindowHint)
         self._frameless_resizer = FramelessResizer(self)
+        # Visible SE-corner resize grip so the user has a discoverable
+        # affordance to grab. FramelessResizer handles invisible edge drag.
+        self._size_grip = QSizeGrip(self)
+        self._size_grip.setFixedSize(16, 16)
+        self._size_grip.raise_()
         self.setMouseTracking(True)
         # Single source of truth for the app-shell look. Per-widget
         # setStyleSheet calls are intentionally avoided so this sheet
@@ -436,6 +442,13 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(4000, self._updater.check)
 
     # ---------------------------------------------------------------- UI
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        # Reposition the SE-corner QSizeGrip on every resize so it stays
+        # pinned to the bottom-right of the window.
+        s = self._size_grip.sizeHint()
+        self._size_grip.move(self.width() - s.width(), self.height() - s.height())
 
     def _build_ui(self) -> None:
         # Custom status bar lives at the bottom of the central layout
