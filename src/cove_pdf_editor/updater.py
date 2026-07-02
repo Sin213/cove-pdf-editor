@@ -42,6 +42,24 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QApplication, QMessageBox, QProgressDialog
 
 
+def _open_url(url: str) -> None:
+    """Open `url` in the default browser without leaking AppImage env.
+
+    QDesktopServices.openUrl spawns xdg-open with the current environment,
+    which inside an AppImage carries LD_LIBRARY_PATH into the browser and
+    crashes it. Spawn xdg-open ourselves with a scrubbed env in that case.
+    """
+    if (os.environ.get("APPDIR") or os.environ.get("APPIMAGE")) and \
+            sys.platform.startswith("linux") and shutil.which("xdg-open"):
+        env = os.environ.copy()
+        for key in ("LD_LIBRARY_PATH", "LD_PRELOAD", "PYTHONHOME", "PYTHONPATH",
+                    "QT_PLUGIN_PATH", "QML2_IMPORT_PATH"):
+            env.pop(key, None)
+        subprocess.Popen(["xdg-open", url], env=env)
+        return
+    QDesktopServices.openUrl(QUrl(url))
+
+
 @dataclass
 class UpdateInfo:
     latest_version: str
@@ -507,11 +525,11 @@ class UpdateController(QObject):
         if install_btn is not None and clicked is install_btn:
             self._install(info)
         elif open_btn is not None and clicked is open_btn:
-            QDesktopServices.openUrl(QUrl(info.release_url))
+            _open_url(info.release_url)
 
     def _install(self, info: UpdateInfo) -> None:
         if not info.asset_url or not info.asset_name:
-            QDesktopServices.openUrl(QUrl(info.release_url))
+            _open_url(info.release_url)
             return
         if not info.sha256_url:
             # Refuse to swap the running binary without a checksum to
@@ -523,7 +541,7 @@ class UpdateController(QObject):
                 "Couldn't find a sha256 sidecar for this release; "
                 "skipping the in-place update for safety.",
             )
-            QDesktopServices.openUrl(QUrl(info.release_url))
+            _open_url(info.release_url)
             return
         self._pending_info = info
         cache = Path(os.path.expanduser(f"~/.cache/{self._cache_subdir}"))
