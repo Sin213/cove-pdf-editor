@@ -16,7 +16,7 @@ from . import theme
 
 
 _TITLEBAR_HEIGHT = 36
-_RESIZE_MARGIN = 6
+_RESIZE_MARGIN = 8
 _BTN_W = 46
 
 
